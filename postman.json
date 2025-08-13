@@ -1,0 +1,247 @@
+{
+  "info": {
+    "name": "NoteFlix API",
+    "_postman_id": "11111111-2222-3333-4444-555555555555",
+    "description": "REST API for NoteFlix (notes → animated podcast). Includes auth, assets, jobs, and load-test helpers.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "{{baseUrl}}" },
+    { "key": "token", "value": "{{token}}" },
+    { "key": "assetId", "value": "{{assetId}}" },
+    { "key": "jobId", "value": "{{jobId}}" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "GET /healthz",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/healthz", "host": ["{{baseUrl}}"], "path": ["healthz"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "POST /api/v1/auth/login",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{username}}\",\n  \"password\": \"{{password}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/login",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "auth", "login"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Login OK', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "const json = pm.response.json();",
+                  "if (json && json.token) {",
+                  "  pm.environment.set('token', json.token);",
+                  "  console.log('Token saved to environment');",
+                  "} else {",
+                  "  pm.test('Token missing in response', function(){ pm.expect(false).to.be.true; });",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /api/v1/me",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": { "raw": "{{baseUrl}}/api/v1/me", "host": ["{{baseUrl}}"], "path": ["api", "v1", "me"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Assets",
+      "item": [
+        {
+          "name": "POST /api/v1/assets (upload PDF/images)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "file", "type": "file", "src": [] }
+              ]
+            },
+            "url": { "raw": "{{baseUrl}}/api/v1/assets", "host": ["{{baseUrl}}"], "path": ["api", "v1", "assets"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Upload OK', function(){ pm.response.to.have.status(200); });",
+                  "const json = pm.response.json();",
+                  "if (json && json.id) { pm.environment.set('assetId', json.id); console.log('assetId=', json.id); }"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /api/v1/assets (list mine)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/assets",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "assets"]
+            }
+          }
+        },
+        {
+          "name": "GET /api/v1/assets/:id",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/assets/{{assetId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "assets", "{{assetId}}"]
+            }
+          }
+        },
+        {
+          "name": "DELETE /api/v1/assets/:id",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/assets/{{assetId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "assets", "{{assetId}}"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Jobs",
+      "item": [
+        {
+          "name": "POST /api/v1/jobs/process",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"assetId\": \"{{assetId}}\",\n  \"style\": \"kenburns\",\n  \"duration\": 90\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/jobs/process",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "jobs", "process"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Process job accepted', function(){ pm.response.to.have.status(200); });",
+                  "const json = pm.response.json();",
+                  "if (json && json.jobId) { pm.environment.set('jobId', json.jobId); console.log('jobId=', json.jobId); }"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /api/v1/jobs (list mine)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": { "raw": "{{baseUrl}}/api/v1/jobs", "host": ["{{baseUrl}}"], "path": ["api", "v1", "jobs"] }
+          }
+        },
+        {
+          "name": "GET /api/v1/jobs/:id",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": { "raw": "{{baseUrl}}/api/v1/jobs/{{jobId}}", "host": ["{{baseUrl}}"], "path": ["api", "v1", "jobs", "{{jobId}}"] }
+          }
+        },
+        {
+          "name": "GET /api/v1/jobs/:id/logs",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": { "raw": "{{baseUrl}}/api/v1/jobs/{{jobId}}/logs", "host": ["{{baseUrl}}"], "path": ["api", "v1", "jobs", "{{jobId}}", "logs"] }
+          }
+        },
+        {
+          "name": "GET /api/v1/jobs/:id/output (binary stream)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": { "raw": "{{baseUrl}}/api/v1/jobs/{{jobId}}/output", "host": ["{{baseUrl}}"], "path": ["api", "v1", "jobs", "{{jobId}}", "output"] }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Load Test Helper",
+      "item": [
+        {
+          "name": "Fire 10 jobs (quick)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": { "raw": "{{baseUrl}}/api/v1/jobs/process", "host": ["{{baseUrl}}"], "path": ["api", "v1", "jobs", "process"] },
+            "body": { "mode": "raw", "raw": "{ \"assetId\": \"{{assetId}}\", \"style\": \"kenburns\", \"duration\": 90 }" }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "// This tab is just a template; duplicate it 10x and hit Send All if you want a quick burst.",
+                  "pm.variables.set('i', (pm.variables.get('i') || 0) + 1);"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
