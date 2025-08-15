@@ -220,17 +220,28 @@ ${excerpt || "(No extracted text available. Create a generic motivational study 
 
       // 3) Optional TTS via espeak-ng -> narration.wav (fallback to captions-only)
       let narrationPath = null;
-      if (hasCmd("espeak-ng")) {
-        narrationPath = path.join(ctx.jobDir, "narration.wav");
-        const tts = sh(`espeak-ng -v en+f3 -s 170 -w "${narrationPath}" ${JSON.stringify(scriptText)}`);
-        log(tts.stderr || "");
-        if (tts.status !== 0 || !fs.existsSync(narrationPath)) {
-          log("WARN: espeak-ng failed; proceeding without narration audio.");
-          narrationPath = null;
-        }
-      } else {
-        log("INFO: espeak-ng not found; proceeding without narration audio (captions only).");
-      }
+let narrationCmd = null;
+
+if (hasCmd("pico2wave")) {
+  narrationPath = path.join(ctx.jobDir, "narration.wav");
+  narrationCmd = `pico2wave -l en-US -w "${narrationPath}" ${JSON.stringify(scriptText)}`;
+} else if (hasCmd("espeak-ng")) {
+  narrationPath = path.join(ctx.jobDir, "narration.wav");
+  narrationCmd = `espeak-ng -v en+f3 -s 170 -w "${narrationPath}" ${JSON.stringify(scriptText)}`;
+}
+
+if (narrationCmd) {
+  const tts = sh(narrationCmd);
+  log(tts.stderr || "");
+  if (tts.status !== 0 || !fs.existsSync(narrationPath)) {
+    log("WARN: TTS failed; proceeding without narration audio.");
+    narrationPath = null;
+  }
+} else {
+  log("INFO: no TTS tool found; proceeding without narration audio (captions only).");
+}
+
+const hasAudio = Boolean(narrationPath);
 
       // 4) Create captions.vtt from script
       const vtt = makeVttFromScript(scriptText);
@@ -238,13 +249,11 @@ ${excerpt || "(No extracted text available. Create a generic motivational study 
       fs.writeFileSync(vttPath, vtt, "utf8");
 
       // 5) Assemble slideshow with Ken Burns + captions (and audio if present)
-      const vf = `zoompan=z='zoom+0.001':d=150:s=1920x1080,fps=30,subtitles='${vttPath.replace(/'/g,"\\'")}',format=yuv420p`;
-      const fr = 1/5; // 1 image every 5s before zoompan stretches
-      const hasAudio = Boolean(narrationPath);
-
-      const cmd = hasAudio
-  ? `ffmpeg -y -framerate ${fr} -start_number 1 -i "${ctx.jobDir}/slide-%d.png" -i "${narrationPath}" -filter_complex "${vf}" -c:v libx264 -preset slow -crf 20 -c:a aac -b:a 192k -shortest "${ctx.outputPath}"`
-  : `ffmpeg -y -framerate ${fr} -start_number 1 -i "${ctx.jobDir}/slide-%d.png" -filter_complex "${vf}" -c:v libx264 -preset slow -crf 20 -pix_fmt yuv420p "${ctx.outputPath}"`;
+     const vf = `zoompan=z='zoom+0.001':d=150:s=1920x1080,fps=30,subtitles='${vttPath.replace(/'/g,"\\'")}',format=yuv420p`;
+const fr = 1/5;
+const cmd = hasAudio
+  ? `ffmpeg -y -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" -i "${narrationPath}" -filter_complex "${vf}" -c:v libx264 -preset slow -crf 20 -c:a aac -b:a 192k -shortest "${ctx.outputPath}"`
+  : `ffmpeg -y -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" -filter_complex "${vf}" -c:v libx264 -preset slow -crf 20 -pix_fmt yuv420p "${ctx.outputPath}"`;
 
       const enc = spawn("bash", ["-lc", cmd]);
       enc.stdout.on("data", d => log(d.toString()));
