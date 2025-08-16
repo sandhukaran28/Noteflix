@@ -4,8 +4,8 @@ const { db } = require("../db");
 const { v4: uuid } = require("uuid");
 const path = require("path");
 const fs = require("fs");
-const { spawn } = require("child_process");
-const { spawnSync } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
+const { synthesizePodcast } = require("../utils/tts");
 
 const DATA_ROOT = process.env.DATA_ROOT || "./data";
 const TMP_DIR = path.join(DATA_ROOT, "tmp");
@@ -67,6 +67,17 @@ function makeVttFromScript(text) {
     vtt += `1\n00:00:00.000 --> 00:00:03.000\n(no script)\n\n`;
   }
   return vtt;
+}
+
+// remove timecodes/markdown and collapse spaces for TTS
+function cleanForTTS(text) {
+  return text
+    .replace(/\*\*?\s*\[[^\]]+\]\s*\*?\s*/g, " ") // **[0-10 seconds]**
+    .replace(/\[[0-9:\- ]+seconds?\]/gi, " ") // [0-10 seconds]
+    .replace(/\*\*/g, " ") // bold **
+    .replace(/[_`#>-]/g, " ") // misc markdown
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 // ---------- create job ----------
@@ -221,8 +232,14 @@ function runJob(id, asset, ctx) {
         const excerpt = (notes || "").trim().slice(0, 4000);
         const duet = ctx.dialogue === "duet";
         const prompt = `
-You are scripting a short educational podcast${duet ? " with TWO speakers (Alex and Sam)" : ""}.
-${duet ? "Write alternating lines starting with 'Alex:' and 'Sam:'." : "Write a single narrator script."}
+You are scripting a short educational podcast${
+          duet ? " with TWO speakers (Alex and Sam)" : ""
+        }.
+${
+  duet
+    ? "Write alternating lines starting with 'Alex:' and 'Sam:'."
+    : "Write a single narrator script."
+}
 Constraints:
 - Length: ~60–120 seconds total
 - Friendly, precise, clear. Short sentences. No filler.
@@ -247,135 +264,59 @@ ${excerpt || "(No extracted text available. Create a generic study overview.)"}
           "This video animates your uploaded slide. Add more pages for a richer episode.";
       }
 
-      // Save script, and a sanitized TTS text
+      // Save raw script
       const scriptPath = path.join(ctx.jobDir, "script.txt");
       fs.writeFileSync(scriptPath, scriptText, "utf8");
 
-      const ttsText = scriptText
-        .replace(/\r/g, " ")
-        .replace(/\n+/g, ". ")
-        .replace(/[ \t]+/g, " ")
-        .trim();
-      const ttsPath = path.join(ctx.jobDir, "tts.txt");
-      fs.writeFileSync(ttsPath, ttsText, "utf8");
+      // 3) TTS (solo/duet) -> narration.wav using Piper (via utils/tts)
+      const cleaned = cleanForTTS(scriptText);
 
-      // 3) TTS (solo/duet) -> narration.wav (optional)
-      async function synthSolo(ctx, ttsPath) {
-        if (!hasCmd("espeak-ng")) {
-          return {
-            path: null,
-            log: "INFO: espeak-ng not found; proceeding captions-only.",
-          };
-        }
-        const out = path.join(ctx.jobDir, "narration.wav");
-        const cmd = `espeak-ng -v en+f3 -s 150 -p 45 -a 140 -g 8 -w "${out}" -f "${ttsPath}"`;
-        const r = sh(cmd);
-        return fs.existsSync(out)
-          ? { path: out, log: r.stderr || "" }
-          : { path: null, log: "WARN: TTS failed; proceeding without narration." };
-      }
-
-      function parseDuet(script) {
-        const lines = script
+      let scriptLines;
+      if (ctx.dialogue === "duet") {
+        // If lines like "Alex: ..." / "Sam: ..." exist, preserve order.
+        const labeled = cleaned
           .split(/\r?\n/)
           .map((s) => s.trim())
           .filter(Boolean);
-        const segs = [];
-        for (const line of lines) {
-          const m = /^(Alex|Sam):\s*(.+)$/i.exec(line);
-          if (m) segs.push({ speaker: m[1].toLowerCase(), text: m[2] });
+        const hasLabels = labeled.some((l) => /^alex:|^sam:/i.test(l));
+        if (hasLabels) {
+          scriptLines = labeled.map((l) => l.replace(/^(alex|sam):\s*/i, ""));
+        } else {
+          // Fallback: alternate by sentence
+          scriptLines = cleaned.split(/(?<=[.!?])\s+/).filter(Boolean);
         }
-        if (segs.length === 0) {
-          const sentences = script
-            .replace(/\r/g, " ")
-            .split(/(?<=[.!?])\s+/)
-            .filter(Boolean);
-          for (let i = 0; i < sentences.length; i++) {
-            segs.push({
-              speaker: i % 2 === 0 ? "alex" : "sam",
-              text: sentences[i],
-            });
-          }
-        }
-        return segs;
-      }
-
-      async function synthDuet(ctx, scriptText) {
-        if (!hasCmd("espeak-ng")) {
-          return { path: null, log: "INFO: espeak-ng not found; duet captions-only." };
-        }
-        const segs = parseDuet(scriptText);
-        const work = [];
-        const logs = [];
-        for (let i = 0; i < segs.length; i++) {
-          const { speaker, text } = segs[i];
-          const wav = path.join(
-            ctx.jobDir,
-            `seg-${String(i + 1).padStart(3, "0")}.wav`
-          );
-          const clean = text
-            .replace(/\r/g, " ")
-            .replace(/\n+/g, ". ")
-            .replace(/[ \t]+/g, " ")
-            .trim();
-
-          // write each segment to a file to avoid quoting issues
-          const segTxt = path.join(
-            ctx.jobDir,
-            `seg-${String(i + 1).padStart(3, "0")}.txt`
-          );
-          fs.writeFileSync(segTxt, clean + "\n", "utf8");
-
-          // distinct voices + pacing
-          const voice = speaker === "alex" ? "en+f3" : "en+m3";
-          const speed = speaker === "alex" ? 145 : 148;
-          const pitch = speaker === "alex" ? 48 : 42;
-
-          const cmd = `espeak-ng -v ${voice} -s ${speed} -p ${pitch} -a 140 -g 10 -w "${wav}" -f "${segTxt}"`;
-          const r = sh(cmd);
-          if (r.stderr) logs.push(r.stderr);
-          if (!fs.existsSync(wav))
-            return { path: null, log: "WARN: duet TTS failed; captions-only." };
-
-          // 200ms turn-taking pause
-          const pad = path.join(
-            ctx.jobDir,
-            `sil-${String(i + 1).padStart(3, "0")}.wav`
-          );
-          sh(
-            `ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=mono -t 0.20 "${pad}" >/dev/null 2>&1`
-          );
-          work.push(wav, pad);
-        }
-
-        // concat segments
-        const list = path.join(ctx.jobDir, "concat.txt");
-        fs.writeFileSync(
-          list,
-          work.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n"),
-          "utf8"
-        );
-        const out = path.join(ctx.jobDir, "narration.wav");
-        const concat = sh(
-          `ffmpeg -y -f concat -safe 0 -i "${list}" -ar 44100 -ac 1 -c:a pcm_s16le "${out}"`
-        );
-        if (concat.stderr) logs.push(concat.stderr);
-        return fs.existsSync(out)
-          ? { path: out, log: logs.join("\n") }
-          : { path: null, log: "WARN: concat failed; duet captions-only." };
-      }
-
-      let narrationPath = null;
-      if (ctx.dialogue === "duet") {
-        const duetRes = await synthDuet(ctx, scriptText);
-        log(duetRes.log || "");
-        narrationPath = duetRes.path;
       } else {
-        const soloRes = await synthSolo(ctx, ttsPath);
-        log(soloRes.log || "");
-        narrationPath = soloRes.path;
+        // solo narrator — one big line is fine; Piper pauses at sentence boundaries
+        scriptLines = [cleaned];
       }
-      const hasAudio = Boolean(narrationPath);
+
+      fs.writeFileSync(
+        path.join(ctx.jobDir, "tts_clean.txt"),
+        scriptLines.join("\n"),
+        "utf8"
+      );
+
+      log("Starting TTS synthesis (Piper)...");
+      let narrationPath = null;
+      try {
+        narrationPath = path.join(ctx.jobDir, "narration.wav");
+        const voices = {
+          voiceA: process.env.PIPER_VOICE_A || "/app/models/en_US-amy-low.onnx",
+          voiceB:
+            process.env.PIPER_VOICE_B || "/app/models/en_GB-jenny_low.onnx",
+        };
+        await synthesizePodcast(
+          scriptLines,
+          narrationPath,
+          ctx.dialogue === "duet",
+          voices
+        );
+        log("TTS synthesis complete");
+      } catch (e) {
+        log("TTS synthesis failed: " + e.message);
+        narrationPath = null;
+      }
+      const hasAudio = !!narrationPath && fs.existsSync(narrationPath);
 
       // 4) captions
       const vtt = makeVttFromScript(scriptText);
