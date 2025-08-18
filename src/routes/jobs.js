@@ -72,13 +72,23 @@ function makeVttFromScript(text) {
 // remove timecodes/markdown and collapse spaces for TTS
 function cleanForTTS(text) {
   return text
-    .replace(/\*\*?\s*\[[^\]]+\]\s*\*?\s*/g, " ") // **[0-10 seconds]**
-    .replace(/\[[0-9:\- ]+seconds?\]/gi, " ") // [0-10 seconds]
-    .replace(/\*\*/g, " ") // bold **
-    .replace(/[_`#>-]/g, " ") // misc markdown
+    .normalize("NFKD")
+    // remove meta intro line entirely
+    .replace(/^Here is the script for the podcast.*$/i, "")
+    // strip leading speaker tags like "Alex:" or "Sam:"
+    .replace(/^(Alex|Sam):\s*/i, "")
+    // remove non ASCII
+    .replace(/[^\x00-\x7F]+/g, " ")
+    // remove markdown links or emphasis
+    .replace(/\*\*?\s*\[[^\]]+\]\s*\*?\s*/g, " ")
+    // remove timecode markers
+    .replace(/\[[0-9:\- ]+seconds?\]/gi, " ")
+    .replace(/\*\*/g, " ")
+    .replace(/[_`#>•▪︎•·–—“”‘’]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
+
 
 // ---------- create job ----------
 r.post("/process", (req, res) => {
@@ -295,7 +305,7 @@ ${excerpt || "(No extracted text available. Create a generic study overview.)"}
         scriptLines.join("\n"),
         "utf8"
       );
-
+      console.log("TTS script", scriptLines); 
       log("Starting TTS synthesis (Piper)...");
       let narrationPath = null;
       try {
