@@ -25,6 +25,19 @@ function hasCmd(name) {
   return r.status === 0 && r.stdout.trim().length > 0;
 }
 
+// helper: get audio duration with ffprobe
+function getAudioDuration(file) {
+  try {
+    const out = spawnSync("bash", ["-lc", `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${file}"`], { encoding: "utf8" });
+    if (out.status === 0) {
+      return Math.ceil(parseFloat(out.stdout.trim()));
+    }
+  } catch (e) {
+    return null;
+  }
+  return null;
+}
+
 async function callOllama(prompt, { base, model }) {
   const url = `${base || "http://localhost:11434"}/api/generate`;
   const body = {
@@ -73,21 +86,22 @@ function makeVttFromScript(text) {
 function cleanForTTS(text) {
   return text
     .normalize("NFKD")
-    // remove meta intro line entirely
-    .replace(/^Here is the script for the podcast.*$/i, "")
-    // strip leading speaker tags like "Alex:" or "Sam:"
-    .replace(/^(Alex|Sam):\s*/i, "")
+    // remove any "Here is the script..." intro, even with variations
+    .replace(/Here is the script[^:]*:\s*/gi, "")
+    // strip speaker tags like "Alex:" or "Sam:" anywhere in the text
+    .replace(/\b(Alex|Sam):\s*/gi, "")
     // remove non ASCII
     .replace(/[^\x00-\x7F]+/g, " ")
-    // remove markdown links or emphasis
+    // remove markdown-style [links]
     .replace(/\*\*?\s*\[[^\]]+\]\s*\*?\s*/g, " ")
     // remove timecode markers
     .replace(/\[[0-9:\- ]+seconds?\]/gi, " ")
     .replace(/\*\*/g, " ")
     .replace(/[_`#>•▪︎•·–—“”‘’]/g, " ")
-    .replace(/\s+/g, " ")
+    .replace(/\s+/g, " ") // collapse spaces
     .trim();
 }
+
 
 
 // ---------- create job ----------
@@ -279,7 +293,10 @@ ${excerpt || "(No extracted text available. Create a generic study overview.)"}
       fs.writeFileSync(scriptPath, scriptText, "utf8");
 
       // 3) TTS (solo/duet) -> narration.wav using Piper (via utils/tts)
+      console.log("TTS script:", scriptText);
+      log("Cleaning script for TTS...");
       const cleaned = cleanForTTS(scriptText);
+      console.log("Cleaned script:", cleaned);
 
       let scriptLines;
       if (ctx.dialogue === "duet") {
@@ -310,11 +327,10 @@ ${excerpt || "(No extracted text available. Create a generic study overview.)"}
       let narrationPath = null;
       try {
         narrationPath = path.join(ctx.jobDir, "narration.wav");
-        const voices = {
-          voiceA: process.env.PIPER_VOICE_A || "/app/models/en_US-amy-low.onnx",
-          voiceB:
-            process.env.PIPER_VOICE_B || "/app/models/en_GB-jenny_low.onnx",
-        };
+       const voices = {
+  voiceA: process.env.PIPER_VOICE_A || "/app/models/en_US-amy-medium.onnx",
+  voiceB: process.env.PIPER_VOICE_B || "/app/models/en_US-ryan-high.onnx",
+};
         await synthesizePodcast(
           scriptLines,
           narrationPath,
@@ -340,22 +356,29 @@ ${excerpt || "(No extracted text available. Create a generic study overview.)"}
         .sort();
       const nSlides = Math.max(1, slides.length);
 
-      const perSlideSec = Math.max(
-        3,
-        Math.round((ctx.duration || 90) / nSlides)
-      );
+      // get narration duration if available
+      let totalDuration = ctx.duration || 90;
+      if (hasAudio) {
+        const dur = getAudioDuration(narrationPath);
+        if (dur && dur > 0) {
+          totalDuration = dur;
+          log(`Detected narration length: ${dur}s`);
+        }
+      }
+
+      // distribute slides evenly across actual narration length
+      const perSlideSec = Math.max(3, Math.round(totalDuration / nSlides));
       const fpsOut = 30;
-      const dFrames = perSlideSec * fpsOut; // zoompan d=frames per input image
+      const dFrames = perSlideSec * fpsOut;
       const vf = `zoompan=z='zoom+0.001':d=${dFrames}:s=1920x1080,fps=${fpsOut},subtitles='${vttPath.replace(
         /'/g,
         "\\'"
       )}',format=yuv420p`;
-      const fr = 1 / perSlideSec; // input images per second
+      const fr = 1 / perSlideSec;
 
       const cmd = hasAudio
         ? `ffmpeg -y -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" -i "${narrationPath}" -filter_complex "${vf}" -c:v libx264 -preset slow -crf 20 -c:a aac -b:a 192k -shortest "${ctx.outputPath}"`
         : `ffmpeg -y -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" -filter_complex "${vf}" -c:v libx264 -preset slow -crf 20 -pix_fmt yuv420p "${ctx.outputPath}"`;
-
       const enc = spawn("bash", ["-lc", cmd]);
       enc.stdout.on("data", (d) => log(d.toString()));
       enc.stderr.on("data", (d) => log(d.toString()));
