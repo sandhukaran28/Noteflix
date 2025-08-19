@@ -28,7 +28,14 @@ function hasCmd(name) {
 // helper: get audio duration with ffprobe
 function getAudioDuration(file) {
   try {
-    const out = spawnSync("bash", ["-lc", `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${file}"`], { encoding: "utf8" });
+    const out = spawnSync(
+      "bash",
+      [
+        "-lc",
+        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${file}"`,
+      ],
+      { encoding: "utf8" }
+    );
     if (out.status === 0) {
       return Math.ceil(parseFloat(out.stdout.trim()));
     }
@@ -86,23 +93,16 @@ function makeVttFromScript(text) {
 function cleanForTTS(text) {
   return text
     .normalize("NFKD")
-    // remove any "Here is the script..." intro, even with variations
     .replace(/Here is the script[^:]*:\s*/gi, "")
-    // strip speaker tags like "Alex:" or "Sam:" anywhere in the text
     .replace(/\b(Alex|Sam):\s*/gi, "")
-    // remove non ASCII
     .replace(/[^\x00-\x7F]+/g, " ")
-    // remove markdown-style [links]
     .replace(/\*\*?\s*\[[^\]]+\]\s*\*?\s*/g, " ")
-    // remove timecode markers
     .replace(/\[[0-9:\- ]+seconds?\]/gi, " ")
     .replace(/\*\*/g, " ")
     .replace(/[_`#>•▪︎•·–—“”‘’]/g, " ")
-    .replace(/\s+/g, " ") // collapse spaces
+    .replace(/\s+/g, " ")
     .trim();
 }
-
-
 
 // ---------- create job ----------
 r.post("/process", (req, res) => {
@@ -112,6 +112,7 @@ r.post("/process", (req, res) => {
     style = "kenburns",
     duration = 90,
     dialogue = "solo",
+    encodeProfile = "balanced", // NEW
   } = req.body || {};
 
   const asset = db.prepare(`SELECT * FROM assets WHERE id = ?`).get(assetId);
@@ -132,7 +133,7 @@ r.post("/process", (req, res) => {
     id,
     assetId,
     user?.sub || "unknown",
-    JSON.stringify({ style, duration, dialogue }),
+    JSON.stringify({ style, duration, dialogue, encodeProfile }),
     logsPath
   );
 
@@ -144,6 +145,7 @@ r.post("/process", (req, res) => {
       logsPath,
       duration,
       dialogue,
+      encodeProfile,
     })
   );
 
@@ -175,34 +177,41 @@ r.get("/:id/logs", (req, res) => {
   fs.createReadStream(row.logsPath).pipe(res);
 });
 
-// ---------- output (Range) ----------
+// ---------- output (Download) ----------
 r.get("/:id/output", (req, res) => {
   const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
-  if (!row || !row.outputPath || !fs.existsSync(row.outputPath))
+  if (!row || !row.outputPath || !fs.existsSync(row.outputPath)) {
     return res.status(404).json({ error: "not found" });
+  }
 
   const stat = fs.statSync(row.outputPath);
+
+  // Always set download header
+  res.setHeader("Content-Disposition", "attachment; filename=video.mp4");
+  res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Accept-Ranges", "bytes");
+
   const range = req.headers.range;
   if (range) {
     const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
     const start = parseInt(startStr, 10);
     const end = endStr ? parseInt(endStr, 10) : stat.size - 1;
+
     res.writeHead(206, {
       "Content-Range": `bytes ${start}-${end}/${stat.size}`,
-      "Accept-Ranges": "bytes",
       "Content-Length": end - start + 1,
-      "Content-Type": "video/mp4",
     });
+
     fs.createReadStream(row.outputPath, { start, end }).pipe(res);
   } else {
     res.writeHead(200, {
       "Content-Length": stat.size,
-      "Content-Type": "video/mp4",
-      "Accept-Ranges": "bytes",
     });
+
     fs.createReadStream(row.outputPath).pipe(res);
   }
 });
+
 
 module.exports = r;
 
@@ -239,7 +248,7 @@ function runJob(id, asset, ctx) {
       log(ls.stdout || "");
       log(ls.stderr || "");
 
-      // 2) Extract text + Ollama script
+      // 2) Extract text + Ollama script (duration-aware)
       let scriptText = "";
       if (isPdf) {
         if (!hasCmd("pdftotext"))
@@ -253,8 +262,17 @@ function runJob(id, asset, ctx) {
             notes = fs.readFileSync(textPath, "utf8");
           }
         }
-        const excerpt = (notes || "").trim().slice(0, 4000);
+
+        // Dynamic word target from requested duration
+        const wpm = 150; // ~2.5 words/sec
+        const targetSeconds = Math.max(
+          30,
+          Math.min(600, Number(ctx.duration || 90))
+        ); // clamp 30s–10m
+        const targetWords = Math.round((wpm / 60) * targetSeconds);
+
         const duet = ctx.dialogue === "duet";
+        const excerpt = (notes || "").trim().slice(0, 4000);
         const prompt = `
 You are scripting a short educational podcast${
           duet ? " with TWO speakers (Alex and Sam)" : ""
@@ -264,10 +282,12 @@ ${
     ? "Write alternating lines starting with 'Alex:' and 'Sam:'."
     : "Write a single narrator script."
 }
+
 Constraints:
-- Length: ~60–120 seconds total
-- Friendly, precise, clear. Short sentences. No filler.
+- Target length: ~${targetWords} words (≈ ${targetSeconds} seconds at ~${wpm} wpm).
+- Friendly, precise, clear. Short sentences (6–16 words). No filler.
 - Keep it grounded in the NOTES content. If missing, infer a reasonable, generic overview.
+- Do NOT include stage directions, timecodes, or markdown—just the spoken lines.
 
 NOTES:
 ${excerpt || "(No extracted text available. Create a generic study overview.)"}
@@ -322,15 +342,15 @@ ${excerpt || "(No extracted text available. Create a generic study overview.)"}
         scriptLines.join("\n"),
         "utf8"
       );
-      console.log("TTS script", scriptLines); 
+      console.log("TTS script", scriptLines);
       log("Starting TTS synthesis (Piper)...");
       let narrationPath = null;
       try {
         narrationPath = path.join(ctx.jobDir, "narration.wav");
-       const voices = {
-  voiceA: process.env.PIPER_VOICE_A || "/app/models/en_US-amy-medium.onnx",
-  voiceB: process.env.PIPER_VOICE_B || "/app/models/en_US-ryan-high.onnx",
-};
+        const voices = {
+          voiceA: process.env.PIPER_VOICE_A || "/app/models/en_US-amy-medium.onnx",
+          voiceB: process.env.PIPER_VOICE_B || "/app/models/en_US-ryan-high.onnx",
+        };
         await synthesizePodcast(
           scriptLines,
           narrationPath,
@@ -349,14 +369,14 @@ ${excerpt || "(No extracted text available. Create a generic study overview.)"}
       const vttPath = path.join(ctx.jobDir, "captions.vtt");
       fs.writeFileSync(vttPath, vtt, "utf8");
 
-      // 5) duration-aware timing & encoding
+      // 5) duration-aware timing & HEAVIER encoding
       const slides = fs
         .readdirSync(ctx.jobDir)
         .filter((f) => /^slide-.*\.png$/i.test(f))
         .sort();
       const nSlides = Math.max(1, slides.length);
 
-      // get narration duration if available
+      // narration-aware duration
       let totalDuration = ctx.duration || 90;
       if (hasAudio) {
         const dur = getAudioDuration(narrationPath);
@@ -366,23 +386,81 @@ ${excerpt || "(No extracted text available. Create a generic study overview.)"}
         }
       }
 
-      // distribute slides evenly across actual narration length
-      const perSlideSec = Math.max(3, Math.round(totalDuration / nSlides));
-      const fpsOut = 30;
-      const dFrames = perSlideSec * fpsOut;
-      const vf = `zoompan=z='zoom+0.001':d=${dFrames}:s=1920x1080,fps=${fpsOut},subtitles='${vttPath.replace(
-        /'/g,
-        "\\'"
-      )}',format=yuv420p`;
+      const profile = String(ctx.encodeProfile || "balanced").toLowerCase();
+
+      // Timing (slightly longer floor per slide)
+      const perSlideSec = Math.max(4, Math.round(totalDuration / nSlides));
+      const baseFps =
+        profile === "insane" ? 60 : profile === "heavy" ? 48 : 30;
+      const dFrames = perSlideSec * baseFps;
       const fr = 1 / perSlideSec;
 
-      const cmd = hasAudio
-        ? `ffmpeg -y -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" -i "${narrationPath}" -filter_complex "${vf}" -c:v libx264 -preset slow -crf 20 -c:a aac -b:a 192k -shortest "${ctx.outputPath}"`
-        : `ffmpeg -y -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" -filter_complex "${vf}" -c:v libx264 -preset slow -crf 20 -pix_fmt yuv420p "${ctx.outputPath}"`;
-      const enc = spawn("bash", ["-lc", cmd]);
-      enc.stdout.on("data", (d) => log(d.toString()));
-      enc.stderr.on("data", (d) => log(d.toString()));
-      await new Promise((resolve) => enc.on("close", resolve));
+      // Output resolution targets (upscale to burn CPU)
+      const outW = profile === "insane" ? 3840 : profile === "heavy" ? 2560 : 1920;
+      const outH = profile === "insane" ? 2160 : profile === "heavy" ? 1440 : 1080;
+
+      const subtitlePathEsc = vttPath.replace(/'/g, "\\'");
+      const zoom = `zoompan=z='zoom+0.001':d=${dFrames}:s=${outW}x${outH}`;
+      const baseFilters = [
+        zoom,
+        `scale=${outW}:${outH}:flags=lanczos`,
+        `subtitles='${subtitlePathEsc}'`,
+        `unsharp=5:5:0.5:5:5:0.5`,
+        `eq=contrast=1.05:brightness=0.02:saturation=1.05`,
+        `vignette=PI/6`,
+      ];
+
+      // Motion interpolation is very CPU-heavy
+      if (profile !== "balanced") {
+        baseFilters.push(
+          `minterpolate='mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps=${baseFps}'`
+        );
+      }
+      baseFilters.push(`format=yuv420p`);
+      const vf = baseFilters.join(",");
+
+      // Audio filter: normalize & resample
+      const af = hasAudio
+        ? `-ar 48000 -af "loudnorm=I=-16:LRA=11:TP=-1.5"`
+        : "";
+
+      // x264 settings
+      const preset = profile === "insane" ? "veryslow" : profile === "heavy" ? "slower" : "slow";
+      const crf = profile === "insane" ? 16 : profile === "heavy" ? 18 : 20;
+
+      if (profile !== "balanced") {
+        // 2-pass to double CPU work and improve allocation
+        const passlog = path.join(ctx.jobDir, "ffpass");
+        const cmd1 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" ${
+          hasAudio ? `-i "${narrationPath}"` : ""
+        } -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p -an -pass 1 -passlogfile "${passlog}" -f mp4 /dev/null`;
+        log("ENC PASS1: " + cmd1);
+        const enc1 = spawn("bash", ["-lc", cmd1]);
+        enc1.stdout.on("data", (d) => log(d.toString()));
+        enc1.stderr.on("data", (d) => log(d.toString()));
+        await new Promise((resolve) => enc1.on("close", resolve));
+
+        const cmd2 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" ${
+          hasAudio ? `-i "${narrationPath}"` : ""
+        } -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p ${
+          hasAudio ? `${af} -c:a aac -b:a 192k` : ""
+        } -movflags +faststart -shortest -pass 2 -passlogfile "${passlog}" "${ctx.outputPath}"`;
+        log("ENC PASS2: " + cmd2);
+        const enc2 = spawn("bash", ["-lc", cmd2]);
+        enc2.stdout.on("data", (d) => log(d.toString()));
+        enc2.stderr.on("data", (d) => log(d.toString()));
+        await new Promise((resolve) => enc2.on("close", resolve));
+      } else {
+        // Single-pass balanced
+        const cmd = hasAudio
+          ? `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" -i "${narrationPath}" -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p ${af} -c:a aac -b:a 192k -movflags +faststart -shortest "${ctx.outputPath}"`
+          : `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p -movflags +faststart "${ctx.outputPath}"`;
+        log("ENC: " + cmd);
+        const enc = spawn("bash", ["-lc", cmd]);
+        enc.stdout.on("data", (d) => log(d.toString()));
+        enc.stderr.on("data", (d) => log(d.toString()));
+        await new Promise((resolve) => enc.on("close", resolve));
+      }
 
       const cpuSeconds = Math.round((Date.now() - start) / 1000);
       if (!fs.existsSync(ctx.outputPath))
