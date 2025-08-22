@@ -6,6 +6,8 @@ const path = require("path");
 const fs = require("fs");
 const { spawn, spawnSync } = require("child_process");
 const { synthesizePodcast } = require("../utils/tts");
+const { fetchWikiSummary } = require("../utils/wiki");
+
 
 const DATA_ROOT = process.env.DATA_ROOT || "./data";
 const TMP_DIR = path.join(DATA_ROOT, "tmp");
@@ -316,24 +318,35 @@ function runJob(id, asset, ctx) {
 
         const duet = ctx.dialogue === "duet";
         const excerpt = (notes || "").trim().slice(0, 4000);
-        const prompt = `
-You are scripting a short educational podcast${
-          duet ? " with TWO speakers (Alex and Sam)" : ""
-        }.
-${
-  duet
-    ? "Write alternating lines starting with 'Alex:' and 'Sam:'."
-    : "Write a single narrator script."
-}
+
+        let wiki = null;
+try {
+  const orig = (() => {
+    try {
+      const meta = JSON.parse(asset.meta || "{}");
+      return (meta.originalName || "").replace(/\.[^.]+$/, "");
+    } catch { return ""; }
+  })();
+  if (excerpt.length < 120 && orig) {
+    wiki = await fetchWikiSummary(orig);
+  }
+} catch {}
+
+
+const prompt = `
+You are scripting a short educational podcast${duet ? " with TWO speakers (Alex and Sam)" : ""}.
+${duet ? "Write alternating lines starting with 'Alex:' and 'Sam:'." : "Write a single narrator script."}
 
 Constraints:
 - Target length: ~${targetWords} words (≈ ${targetSeconds} seconds at ~${wpm} wpm).
 - Friendly, precise, clear. Short sentences (6–16 words). No filler.
-- Keep it grounded in the NOTES content. If missing, infer a reasonable, generic overview.
+- Keep it grounded in the NOTES content. If missing, you MAY use WIKI if provided.
 - Do NOT include stage directions, timecodes, or markdown—just the spoken lines.
 
 NOTES:
-${excerpt || "(No extracted text available. Create a generic study overview.)"}
+${excerpt || "(No extracted text available.)"}
+
+${wiki ? `WIKI:\n${wiki}\n` : ""}
 `.trim();
 
         const base = process.env.OLLAMA_BASE || "http://localhost:11434";
