@@ -1,7 +1,7 @@
-# CAB432 Assessment 01 Submission
+Assignment 1 - REST API Project - Response to Criteria
 
-**Student name:** Karan Singh Sandhu  
-**Student ID:** n11845619  
+**Name:** Karan Singh Sandhu  
+**Student number:** n11845619  
 
 # Response to marking criteria  
 
