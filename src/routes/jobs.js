@@ -8,7 +8,6 @@ const { spawn, spawnSync } = require("child_process");
 const { synthesizePodcast } = require("../utils/tts");
 const { fetchWikiSummary } = require("../utils/wiki");
 
-
 const DATA_ROOT = process.env.DATA_ROOT || "./data";
 const TMP_DIR = path.join(DATA_ROOT, "tmp");
 const OUT_DIR = path.join(DATA_ROOT, "outputs");
@@ -163,36 +162,58 @@ r.get("/", (req, res) => {
   const limit = Math.max(1, Math.min(100, parseInt(q.limit, 10) || 20));
   const offset = Math.max(0, parseInt(q.offset, 10) || 0);
 
-  const status = typeof q.status === "string" && q.status.trim() ? q.status.trim() : null;
+  const status =
+    typeof q.status === "string" && q.status.trim() ? q.status.trim() : null;
   const assetId = q.assetId?.trim() || null;
   const startedAfter = q.startedAfter?.trim() || null;
   const finishedBefore = q.finishedBefore?.trim() || null;
 
-  const allowedSort = { rowid: "rowid", createdAt: "createdAt", startedAt: "startedAt", finishedAt: "finishedAt" };
+  const allowedSort = {
+    rowid: "rowid",
+    createdAt: "createdAt",
+    startedAt: "startedAt",
+    finishedAt: "finishedAt",
+  };
   const sortKey = allowedSort[q.sort] || "createdAt";
   const orderDir = (q.order || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
 
   const where = ["owner = @owner"];
   const params = { owner: user?.sub || "unknown" };
-  if (status) { where.push("status = @status"); params.status = status; }
-  if (assetId) { where.push("assetId = @assetId"); params.assetId = assetId; }
-  if (startedAfter) { where.push("datetime(startedAt) >= datetime(@startedAfter)"); params.startedAfter = startedAfter; }
-  if (finishedBefore) { where.push("datetime(finishedAt) <= datetime(@finishedBefore)"); params.finishedBefore = finishedBefore; }
+  if (status) {
+    where.push("status = @status");
+    params.status = status;
+  }
+  if (assetId) {
+    where.push("assetId = @assetId");
+    params.assetId = assetId;
+  }
+  if (startedAfter) {
+    where.push("datetime(startedAt) >= datetime(@startedAfter)");
+    params.startedAfter = startedAfter;
+  }
+  if (finishedBefore) {
+    where.push("datetime(finishedAt) <= datetime(@finishedBefore)");
+    params.finishedBefore = finishedBefore;
+  }
 
   const whereSql = where.join(" AND ");
-  const countRow = db.prepare(`SELECT COUNT(*) as cnt FROM jobs WHERE ${whereSql}`).get(params);
+  const countRow = db
+    .prepare(`SELECT COUNT(*) as cnt FROM jobs WHERE ${whereSql}`)
+    .get(params);
   const total = countRow?.cnt || 0;
   const totalPages = Math.ceil(total / limit);
 
   params.limit = limit;
   params.offset = offset;
 
-  const rows = db.prepare(
-    `SELECT * FROM jobs
+  const rows = db
+    .prepare(
+      `SELECT * FROM jobs
      WHERE ${whereSql}
      ORDER BY ${sortKey} ${orderDir}
      LIMIT @limit OFFSET @offset`
-  ).all(params);
+    )
+    .all(params);
 
   // Optional headers for clients that expect them
   res.setHeader("X-Total-Count", String(total));
@@ -202,10 +223,9 @@ r.get("/", (req, res) => {
     page: Math.floor(offset / limit) + 1,
     pageSize: limit,
     totalPages,
-    items: rows
+    items: rows,
   });
 });
-
 
 r.get("/:id", (req, res) => {
   const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
@@ -256,6 +276,53 @@ r.get("/:id/output", (req, res) => {
 
     fs.createReadStream(row.outputPath).pipe(res);
   }
+});
+
+// ---------- captions (Download) ----------
+r.get("/:id/captions", (req, res) => {
+  const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
+  if (!row) return res.status(404).json({ error: "not found" });
+  const jobDir = row.logsPath ? path.dirname(row.logsPath) : null;
+  if (!jobDir) return res.status(404).json({ error: "not found" });
+
+  const vttPath = path.join(jobDir, "captions.vtt");
+  if (!fs.existsSync(vttPath))
+    return res.status(404).json({ error: "no captions" });
+
+  res.setHeader("Content-Type", "text/vtt; charset=utf-8");
+  res.setHeader("Content-Disposition", "attachment; filename=captions.vtt");
+  fs.createReadStream(vttPath).pipe(res);
+});
+
+// ---------- script (Download) ----------
+r.get("/:id/script", (req, res) => {
+  const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
+  if (!row) return res.status(404).json({ error: "not found" });
+  const jobDir = row.logsPath ? path.dirname(row.logsPath) : null;
+  if (!jobDir) return res.status(404).json({ error: "not found" });
+
+  const scriptPath = path.join(jobDir, "script.txt");
+  if (!fs.existsSync(scriptPath))
+    return res.status(404).json({ error: "no script" });
+
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.setHeader("Content-Disposition", "attachment; filename=script.txt");
+  fs.createReadStream(scriptPath).pipe(res);
+});
+
+// ---------- metrics (JSON) ----------
+r.get("/:id/metrics", (req, res) => {
+  const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
+  if (!row) return res.status(404).json({ error: "not found" });
+  const jobDir = row.logsPath ? path.dirname(row.logsPath) : null;
+  if (!jobDir) return res.status(404).json({ error: "not found" });
+
+  const metricsPath = path.join(jobDir, "metrics.json");
+  if (!fs.existsSync(metricsPath))
+    return res.status(404).json({ error: "no metrics" });
+
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  fs.createReadStream(metricsPath).pipe(res);
 });
 
 module.exports = r;
@@ -320,22 +387,29 @@ function runJob(id, asset, ctx) {
         const excerpt = (notes || "").trim().slice(0, 4000);
 
         let wiki = null;
-try {
-  const orig = (() => {
-    try {
-      const meta = JSON.parse(asset.meta || "{}");
-      return (meta.originalName || "").replace(/\.[^.]+$/, "");
-    } catch { return ""; }
-  })();
-  if (excerpt.length < 120 && orig) {
-    wiki = await fetchWikiSummary(orig);
-  }
-} catch {}
+        try {
+          const orig = (() => {
+            try {
+              const meta = JSON.parse(asset.meta || "{}");
+              return (meta.originalName || "").replace(/\.[^.]+$/, "");
+            } catch {
+              return "";
+            }
+          })();
+          if (excerpt.length < 120 && orig) {
+            wiki = await fetchWikiSummary(orig);
+          }
+        } catch {}
 
-
-const prompt = `
-You are scripting a short educational podcast${duet ? " with TWO speakers (Alex and Sam)" : ""}.
-${duet ? "Write alternating lines starting with 'Alex:' and 'Sam:'." : "Write a single narrator script."}
+        const prompt = `
+You are scripting a short educational podcast${
+          duet ? " with TWO speakers (Alex and Sam)" : ""
+        }.
+${
+  duet
+    ? "Write alternating lines starting with 'Alex:' and 'Sam:'."
+    : "Write a single narrator script."
+}
 
 Constraints:
 - Target length: ~${targetWords} words (≈ ${targetSeconds} seconds at ~${wpm} wpm).
@@ -401,8 +475,10 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}
       try {
         narrationPath = path.join(ctx.jobDir, "narration.wav");
         const voices = {
-          voiceA: process.env.PIPER_VOICE_A || "/app/models/en_US-amy-medium.onnx",
-          voiceB: process.env.PIPER_VOICE_B || "/app/models/en_US-ryan-high.onnx",
+          voiceA:
+            process.env.PIPER_VOICE_A || "/app/models/en_US-amy-medium.onnx",
+          voiceB:
+            process.env.PIPER_VOICE_B || "/app/models/en_US-ryan-high.onnx",
         };
         await synthesizePodcast(
           scriptLines,
@@ -443,14 +519,15 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}
 
       // Timing (slightly longer floor per slide)
       const perSlideSec = Math.max(4, Math.round(totalDuration / nSlides));
-      const baseFps =
-        profile === "insane" ? 60 : profile === "heavy" ? 48 : 30;
+      const baseFps = profile === "insane" ? 60 : profile === "heavy" ? 48 : 30;
       const dFrames = perSlideSec * baseFps;
       const fr = 1 / perSlideSec;
 
       // Output resolution targets (upscale to burn CPU)
-      const outW = profile === "insane" ? 3840 : profile === "heavy" ? 2560 : 1920;
-      const outH = profile === "insane" ? 2160 : profile === "heavy" ? 1440 : 1080;
+      const outW =
+        profile === "insane" ? 3840 : profile === "heavy" ? 2560 : 1920;
+      const outH =
+        profile === "insane" ? 2160 : profile === "heavy" ? 1440 : 1080;
 
       const subtitlePathEsc = vttPath.replace(/'/g, "\\'");
       const zoom = `zoompan=z='zoom+0.001':d=${dFrames}:s=${outW}x${outH}`;
@@ -478,13 +555,20 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}
         : "";
 
       // x264 settings
-      const preset = profile === "insane" ? "veryslow" : profile === "heavy" ? "slower" : "slow";
+      const preset =
+        profile === "insane"
+          ? "veryslow"
+          : profile === "heavy"
+          ? "slower"
+          : "slow";
       const crf = profile === "insane" ? 16 : profile === "heavy" ? 18 : 20;
 
       if (profile !== "balanced") {
         // 2-pass to double CPU work and improve allocation
         const passlog = path.join(ctx.jobDir, "ffpass");
-        const cmd1 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" ${
+        const cmd1 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${
+          ctx.jobDir
+        }/slide-*.png" ${
           hasAudio ? `-i "${narrationPath}"` : ""
         } -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p -an -pass 1 -passlogfile "${passlog}" -f mp4 /dev/null`;
         log("ENC PASS1: " + cmd1);
@@ -493,11 +577,15 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}
         enc1.stderr.on("data", (d) => log(d.toString()));
         await new Promise((resolve) => enc1.on("close", resolve));
 
-        const cmd2 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" ${
+        const cmd2 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${
+          ctx.jobDir
+        }/slide-*.png" ${
           hasAudio ? `-i "${narrationPath}"` : ""
         } -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p ${
           hasAudio ? `${af} -c:a aac -b:a 192k` : ""
-        } -movflags +faststart -shortest -pass 2 -passlogfile "${passlog}" "${ctx.outputPath}"`;
+        } -movflags +faststart -shortest -pass 2 -passlogfile "${passlog}" "${
+          ctx.outputPath
+        }"`;
         log("ENC PASS2: " + cmd2);
         const enc2 = spawn("bash", ["-lc", cmd2]);
         enc2.stdout.on("data", (d) => log(d.toString()));
@@ -518,6 +606,27 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}
       const cpuSeconds = Math.round((Date.now() - start) / 1000);
       if (!fs.existsSync(ctx.outputPath))
         throw new Error("ffmpeg failed to produce output");
+      // NEW: write metrics.json
+      try {
+        const outputStat = fs.statSync(ctx.outputPath);
+        const metrics = {
+          durationSeconds: totalDuration,
+          slides: nSlides,
+          fpsTarget: baseFps,
+          resolution: { width: outW, height: outH },
+          profile,
+          hasAudio: !!hasAudio,
+          audioSeconds: hasAudio ? getAudioDuration(narrationPath) : 0,
+          cpuSeconds,
+          outputBytes: outputStat?.size || 0,
+        };
+        fs.writeFileSync(
+          path.join(ctx.jobDir, "metrics.json"),
+          JSON.stringify(metrics, null, 2)
+        );
+      } catch (e) {
+        log("WARN: failed to write metrics.json: " + e.message);
+      }
 
       db.prepare(
         `UPDATE jobs SET status='done', finishedAt=datetime('now'), cpuSeconds=?, outputPath=? WHERE id=?`
