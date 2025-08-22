@@ -153,13 +153,57 @@ r.post("/process", (req, res) => {
 });
 
 // ---------- list + details ----------
+// UPDATED: add pagination, filtering, optional sorting for jobs list
 r.get("/", (req, res) => {
   const user = req.user;
-  const rows = db
-    .prepare(`SELECT * FROM jobs WHERE owner = ? ORDER BY rowid DESC LIMIT 50`)
-    .all(user?.sub || "unknown");
-  res.json(rows);
+  const q = req.query || {};
+
+  const limit = Math.max(1, Math.min(100, parseInt(q.limit, 10) || 20));
+  const offset = Math.max(0, parseInt(q.offset, 10) || 0);
+
+  const status = typeof q.status === "string" && q.status.trim() ? q.status.trim() : null;
+  const assetId = q.assetId?.trim() || null;
+  const startedAfter = q.startedAfter?.trim() || null;
+  const finishedBefore = q.finishedBefore?.trim() || null;
+
+  const allowedSort = { rowid: "rowid", createdAt: "createdAt", startedAt: "startedAt", finishedAt: "finishedAt" };
+  const sortKey = allowedSort[q.sort] || "createdAt";
+  const orderDir = (q.order || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
+
+  const where = ["owner = @owner"];
+  const params = { owner: user?.sub || "unknown" };
+  if (status) { where.push("status = @status"); params.status = status; }
+  if (assetId) { where.push("assetId = @assetId"); params.assetId = assetId; }
+  if (startedAfter) { where.push("datetime(startedAt) >= datetime(@startedAfter)"); params.startedAfter = startedAfter; }
+  if (finishedBefore) { where.push("datetime(finishedAt) <= datetime(@finishedBefore)"); params.finishedBefore = finishedBefore; }
+
+  const whereSql = where.join(" AND ");
+  const countRow = db.prepare(`SELECT COUNT(*) as cnt FROM jobs WHERE ${whereSql}`).get(params);
+  const total = countRow?.cnt || 0;
+  const totalPages = Math.ceil(total / limit);
+
+  params.limit = limit;
+  params.offset = offset;
+
+  const rows = db.prepare(
+    `SELECT * FROM jobs
+     WHERE ${whereSql}
+     ORDER BY ${sortKey} ${orderDir}
+     LIMIT @limit OFFSET @offset`
+  ).all(params);
+
+  // Optional headers for clients that expect them
+  res.setHeader("X-Total-Count", String(total));
+
+  res.json({
+    totalItems: total,
+    page: Math.floor(offset / limit) + 1,
+    pageSize: limit,
+    totalPages,
+    items: rows
+  });
 });
+
 
 r.get("/:id", (req, res) => {
   const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
