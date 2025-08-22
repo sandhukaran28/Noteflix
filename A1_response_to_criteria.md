@@ -1,7 +1,7 @@
 Assignment 1 - REST API Project - Response to Criteria
 
-**Name:** Karan Singh Sandhu  
-**Student number:** n11845619  
+- **Name:** Karan Singh Sandhu  
+- **Student number:** n11845619  
 
 # Response to marking criteria  
 
