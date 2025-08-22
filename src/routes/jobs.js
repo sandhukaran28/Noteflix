@@ -212,7 +212,6 @@ r.get("/:id/output", (req, res) => {
   }
 });
 
-
 module.exports = r;
 
 // ---------- worker ----------
@@ -313,10 +312,8 @@ ${excerpt || "(No extracted text available. Create a generic study overview.)"}
       fs.writeFileSync(scriptPath, scriptText, "utf8");
 
       // 3) TTS (solo/duet) -> narration.wav using Piper (via utils/tts)
-      console.log("TTS script:", scriptText);
       log("Cleaning script for TTS...");
       const cleaned = cleanForTTS(scriptText);
-      console.log("Cleaned script:", cleaned);
 
       let scriptLines;
       if (ctx.dialogue === "duet") {
@@ -342,7 +339,6 @@ ${excerpt || "(No extracted text available. Create a generic study overview.)"}
         scriptLines.join("\n"),
         "utf8"
       );
-      console.log("TTS script", scriptLines);
       log("Starting TTS synthesis (Piper)...");
       let narrationPath = null;
       try {
@@ -404,7 +400,7 @@ ${excerpt || "(No extracted text available. Create a generic study overview.)"}
       const baseFilters = [
         zoom,
         `scale=${outW}:${outH}:flags=lanczos`,
-        `subtitles='${subtitlePathEsc}'`,
+        // captions intentionally NOT burned into the video
         `unsharp=5:5:0.5:5:5:0.5`,
         `eq=contrast=1.05:brightness=0.02:saturation=1.05`,
         `vignette=PI/6`,
