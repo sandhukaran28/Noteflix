@@ -14,14 +14,14 @@ Core criteria
 
 ### Containerise the app
 
-- **ECR Repository name:** *(shown in video; same repo used to push the built image)*  
+- **ECR Repository name:** n11845619-noteflix  
 - **Video timestamp:** 00:21 – 00:37
 - **Relevant files:**
     - `/Dockerfile`
 
 ### Deploy the container
 
-- **EC2 instance ID:** *(shown in video when connecting to host)*  
+- **EC2 instance ID:** i-0af58eedf22a154b0* 
 - **Video timestamp:** 00:38 – 01:08
 
 ### User login
@@ -60,7 +60,7 @@ Core criteria
 
 #### Second kind
 
-- **One line description:** Media artifacts generated/consumed by the pipeline (PDF/PNG/WAV/MP4/VTT).  
+- **One line description:** Media artifacts generated/co    nsumed by the pipeline (PDF/PNG/WAV/MP4/VTT).  
 - **Type:** Unstructured (binary files)  
 - **Rationale:** Large media blobs are stored on disk with Range/206 support for downloads and streaming.  
 - **Video timestamp:** 02:58 – 03:07  
