@@ -1,4 +1,6 @@
 ﻿// src/routes/jobs.js
+"use strict";
+
 const { Router } = require("express");
 const { db } = require("../db");
 const { v4: uuid } = require("uuid");
@@ -8,6 +10,7 @@ const { spawn, spawnSync } = require("child_process");
 const { synthesizePodcast } = require("../utils/tts");
 const { fetchWikiSummary } = require("../utils/wiki");
 
+// -------------------- paths & dirs --------------------
 const DATA_ROOT = process.env.DATA_ROOT || "./data";
 const TMP_DIR = path.join(DATA_ROOT, "tmp");
 const OUT_DIR = path.join(DATA_ROOT, "outputs");
@@ -16,7 +19,43 @@ fs.mkdirSync(OUT_DIR, { recursive: true });
 
 const r = Router();
 
-// ---------- helpers ----------
+// -------------------- schema helpers --------------------
+function getJobTableColumns() {
+  try {
+    const cols = db.prepare(`PRAGMA table_info(jobs)`).all();
+    return new Set(cols.map((c) => c.name));
+  } catch {
+    return new Set();
+  }
+}
+
+function ensureJobColumns() {
+  const names = getJobTableColumns();
+  const alters = [];
+
+  // These are referenced by the code below
+  if (!names.has("createdAt"))
+    alters.push(`ALTER TABLE jobs ADD COLUMN createdAt TEXT DEFAULT (datetime('now'))`);
+  if (!names.has("startedAt"))
+    alters.push(`ALTER TABLE jobs ADD COLUMN startedAt TEXT`);
+  if (!names.has("finishedAt"))
+    alters.push(`ALTER TABLE jobs ADD COLUMN finishedAt TEXT`);
+  if (!names.has("cpuSeconds"))
+    alters.push(`ALTER TABLE jobs ADD COLUMN cpuSeconds INTEGER`);
+  if (!names.has("outputPath"))
+    alters.push(`ALTER TABLE jobs ADD COLUMN outputPath TEXT`);
+  if (!names.has("logsPath"))
+    alters.push(`ALTER TABLE jobs ADD COLUMN logsPath TEXT`);
+
+  for (const sql of alters) {
+    try { db.exec(sql); } catch (_) {}
+  }
+}
+
+// Ensure columns exist at module load
+ensureJobColumns();
+
+// -------------------- shell helpers --------------------
 function sh(cmd, opts = {}) {
   return spawnSync("bash", ["-lc", cmd], { encoding: "utf8", ...opts });
 }
@@ -105,7 +144,7 @@ function cleanForTTS(text) {
     .trim();
 }
 
-// ---------- create job ----------
+// -------------------- create job --------------------
 r.post("/process", (req, res) => {
   const user = req.user;
   const {
@@ -113,7 +152,7 @@ r.post("/process", (req, res) => {
     style = "kenburns",
     duration = 90,
     dialogue = "solo",
-    encodeProfile = "balanced", // NEW
+    encodeProfile = "balanced",
   } = req.body || {};
 
   const asset = db.prepare(`SELECT * FROM assets WHERE id = ?`).get(assetId);
@@ -153,8 +192,7 @@ r.post("/process", (req, res) => {
   res.json({ jobId: id });
 });
 
-// ---------- list + details ----------
-// UPDATED: add pagination, filtering, optional sorting for jobs list
+// -------------------- list + details --------------------
 r.get("/", (req, res) => {
   const user = req.user;
   const q = req.query || {};
@@ -168,14 +206,33 @@ r.get("/", (req, res) => {
   const startedAfter = q.startedAfter?.trim() || null;
   const finishedBefore = q.finishedBefore?.trim() || null;
 
-  const allowedSort = {
-    rowid: "rowid",
-    createdAt: "createdAt",
-    startedAt: "startedAt",
-    finishedAt: "finishedAt",
-  };
-  const sortKey = allowedSort[q.sort] || "createdAt";
-  const orderDir = (q.order || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
+  // --- sorting: supports "field:dir" AND ?order= ---
+  const allowedFields = ["rowid", "createdAt", "startedAt", "finishedAt"];
+  let sortParam = (q.sort || "").toString().trim(); // e.g. "createdAt:desc" or "createdAt"
+  let requestedField = sortParam || "createdAt";
+  let dirFromSort = "";
+
+  if (sortParam.includes(":")) {
+    const [f, d] = sortParam.split(":");
+    requestedField = (f || "").trim() || "createdAt";
+    dirFromSort = (d || "").trim();
+  }
+
+  const orderDir =
+    (dirFromSort || q.order || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
+
+  // Only allow a safe field and one that actually exists (except rowid)
+  const cols = getJobTableColumns();
+  let sortField = "rowid";
+  if (requestedField === "rowid") {
+    sortField = "rowid";
+  } else if (allowedFields.includes(requestedField) && cols.has(requestedField)) {
+    sortField = requestedField;
+  } else if (cols.has("createdAt")) {
+    sortField = "createdAt";
+  } else {
+    sortField = "rowid"; // robust fallback
+  }
 
   const where = ["owner = @owner"];
   const params = { owner: user?.sub || "unknown" };
@@ -209,15 +266,13 @@ r.get("/", (req, res) => {
   const rows = db
     .prepare(
       `SELECT * FROM jobs
-     WHERE ${whereSql}
-     ORDER BY ${sortKey} ${orderDir}
-     LIMIT @limit OFFSET @offset`
+       WHERE ${whereSql}
+       ORDER BY ${sortField} ${orderDir}
+       LIMIT @limit OFFSET @offset`
     )
     .all(params);
 
-  // Optional headers for clients that expect them
   res.setHeader("X-Total-Count", String(total));
-
   res.json({
     totalItems: total,
     page: Math.floor(offset / limit) + 1,
@@ -233,7 +288,7 @@ r.get("/:id", (req, res) => {
   res.json(row);
 });
 
-// ---------- logs ----------
+// -------------------- logs --------------------
 r.get("/:id/logs", (req, res) => {
   const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
   if (!row || !row.logsPath)
@@ -243,7 +298,7 @@ r.get("/:id/logs", (req, res) => {
   fs.createReadStream(row.logsPath).pipe(res);
 });
 
-// ---------- output (Download) ----------
+// -------------------- output (Download) --------------------
 r.get("/:id/output", (req, res) => {
   const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
   if (!row || !row.outputPath || !fs.existsSync(row.outputPath)) {
@@ -278,7 +333,7 @@ r.get("/:id/output", (req, res) => {
   }
 });
 
-// ---------- captions (Download) ----------
+// -------------------- captions (Download) --------------------
 r.get("/:id/captions", (req, res) => {
   const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
   if (!row) return res.status(404).json({ error: "not found" });
@@ -294,7 +349,7 @@ r.get("/:id/captions", (req, res) => {
   fs.createReadStream(vttPath).pipe(res);
 });
 
-// ---------- script (Download) ----------
+// -------------------- script (Download) --------------------
 r.get("/:id/script", (req, res) => {
   const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
   if (!row) return res.status(404).json({ error: "not found" });
@@ -310,7 +365,7 @@ r.get("/:id/script", (req, res) => {
   fs.createReadStream(scriptPath).pipe(res);
 });
 
-// ---------- metrics (JSON) ----------
+// -------------------- metrics (JSON) --------------------
 r.get("/:id/metrics", (req, res) => {
   const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
   if (!row) return res.status(404).json({ error: "not found" });
@@ -327,7 +382,7 @@ r.get("/:id/metrics", (req, res) => {
 
 module.exports = r;
 
-// ---------- worker ----------
+// -------------------- worker --------------------
 function runJob(id, asset, ctx) {
   const log = (s) => fs.appendFileSync(ctx.logsPath, s + "\n");
   const start = Date.now();
@@ -637,7 +692,8 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}
       db.prepare(
         `UPDATE jobs SET status='failed', finishedAt=datetime('now'), cpuSeconds=? WHERE id=?`
       ).run(cpuSeconds, id);
-      log("FAILED: " + (err && err.message ? err.message : String(err)));
+      const msg = err && err.message ? err.message : String(err);
+      log("FAILED: " + msg);
     }
   })();
 }
