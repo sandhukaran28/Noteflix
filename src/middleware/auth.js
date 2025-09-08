@@ -11,7 +11,8 @@ const idVerifier = CognitoJwtVerifier.create({
 function auth(required = true) {
   return async (req, res, next) => {
     const hdr = req.headers.authorization || "";
-    const token = hdr.startsWith("Bearer ") ? hdr.slice(7) : "";
+    let token = hdr.startsWith("Bearer ") ? hdr.slice(7) : "";
+    if (!token && req.cookies?.nf_id) token = req.cookies.nf_id;
     if (!token) {
       if (required) return res.status(401).json({ error: "unauthorized" });
       req.user = null; return next();

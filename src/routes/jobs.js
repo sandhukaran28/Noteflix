@@ -9,6 +9,8 @@ const fs = require("fs");
 const { spawn, spawnSync } = require("child_process");
 const { synthesizePodcast } = require("../utils/tts");
 const { fetchWikiSummary } = require("../utils/wiki");
+const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 // -------------------- paths & dirs --------------------
 const DATA_ROOT = process.env.DATA_ROOT || "./data";
@@ -17,7 +19,21 @@ const OUT_DIR = path.join(DATA_ROOT, "outputs");
 fs.mkdirSync(TMP_DIR, { recursive: true });
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
+const s3 = new S3Client({ region: process.env.AWS_REGION });
+const S3_BUCKET = process.env.S3_BUCKET;
+const S3_PREFIX = (process.env.S3_PREFIX || "noteflix/outputs").replace(/\/+$/,"");
+
 const r = Router();
+
+function s3KeyForJob(jobId) {
+  return `${S3_PREFIX}/${jobId}/video.mp4`;
+}
+
+function ensureS3Columns() {
+  try { db.exec(`ALTER TABLE jobs ADD COLUMN s3Bucket TEXT`); } catch {}
+  try { db.exec(`ALTER TABLE jobs ADD COLUMN s3Key TEXT`); } catch {}
+}
+ensureS3Columns();
 
 // -------------------- schema helpers --------------------
 function getJobTableColumns() {
@@ -299,39 +315,62 @@ r.get("/:id/logs", (req, res) => {
 });
 
 // -------------------- output (Download) --------------------
-r.get("/:id/output", (req, res) => {
+// at top of routes file:
+
+
+// /jobs/:id/output — prefer S3, fallback to local
+r.get("/:id/output", async (req, res) => {
   const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
-  if (!row || !row.outputPath || !fs.existsSync(row.outputPath)) {
-    return res.status(404).json({ error: "not found" });
+  if (!row) return res.status(404).json({ error: "not found" });
+
+  const bucket = row.s3Bucket || process.env.S3_BUCKET;
+  const key = row.s3Key || keyFor(row.id);
+
+  if (bucket && key) {
+    try {
+      const url = await getSignedUrl(
+        s3,
+        new GetObjectCommand({
+          Bucket: bucket,
+          Key: key,
+          // force download filename on S3 side too (nice UX)
+          ResponseContentDisposition: 'attachment; filename="video.mp4"',
+        }),
+        { expiresIn: 900 } // 15 min
+      );
+      return res.redirect(302, url); // <-- critical
+    } catch (e) {
+      console.warn("S3 presign failed:", e.message);
+      // fall-through to local file below
+    }
   }
 
+  // Local fallback
+  if (!row.outputPath || !fs.existsSync(row.outputPath)) {
+    return res.status(404).json({ error: "not found" });
+  }
   const stat = fs.statSync(row.outputPath);
-
-  // Always set download header
-  res.setHeader("Content-Disposition", "attachment; filename=video.mp4");
   res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Content-Disposition", 'attachment; filename="video.mp4"');
   res.setHeader("Accept-Ranges", "bytes");
 
   const range = req.headers.range;
   if (range) {
-    const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
-    const start = parseInt(startStr, 10);
-    const end = endStr ? parseInt(endStr, 10) : stat.size - 1;
-
-    res.writeHead(206, {
-      "Content-Range": `bytes ${start}-${end}/${stat.size}`,
-      "Content-Length": end - start + 1,
-    });
-
+    const m = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!m) return res.status(416).end();
+    let start = m[1] ? parseInt(m[1], 10) : 0;
+    let end = m[2] ? parseInt(m[2], 10) : stat.size - 1;
+    if (isNaN(start) || isNaN(end) || start > end || end >= stat.size) return res.status(416).end();
+    res.status(206);
+    res.setHeader("Content-Range", `bytes ${start}-${end}/${stat.size}`);
+    res.setHeader("Content-Length", String(end - start + 1));
     fs.createReadStream(row.outputPath, { start, end }).pipe(res);
   } else {
-    res.writeHead(200, {
-      "Content-Length": stat.size,
-    });
-
+    res.setHeader("Content-Length", String(stat.size));
     fs.createReadStream(row.outputPath).pipe(res);
   }
 });
+
 
 // -------------------- captions (Download) --------------------
 r.get("/:id/captions", (req, res) => {
@@ -457,14 +496,8 @@ function runJob(id, asset, ctx) {
         } catch {}
 
         const prompt = `
-You are scripting a short educational podcast${
-          duet ? " with TWO speakers (Alex and Sam)" : ""
-        }.
-${
-  duet
-    ? "Write alternating lines starting with 'Alex:' and 'Sam:'."
-    : "Write a single narrator script."
-}
+You are scripting a short educational podcast${duet ? " with TWO speakers (Alex and Sam)" : ""}.
+${duet ? "Write alternating lines starting with 'Alex:' and 'Sam:'." : "Write a single narrator script."}
 
 Constraints:
 - Target length: ~${targetWords} words (≈ ${targetSeconds} seconds at ~${wpm} wpm).
@@ -475,14 +508,14 @@ Constraints:
 NOTES:
 ${excerpt || "(No extracted text available.)"}
 
-${wiki ? `WIKI:\n${wiki}\n` : ""}
-`.trim();
+${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
 
         const base = process.env.OLLAMA_BASE || "http://localhost:11434";
         const model = process.env.OLLAMA_MODEL || "llama3";
         log(`Calling Ollama at ${base} with model ${model} ...`);
         try {
-          scriptText = await callOllama(prompt, { base, model });
+          // scriptText = await callOllama(prompt, { base, model });
+           scriptText = "This video animates your uploaded slide. Add more pages for a richer episode."
         } catch (e) {
           log("Ollama call failed: " + e.message);
           scriptText =
@@ -492,7 +525,7 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}
         scriptText =
           "This video animates your uploaded slide. Add more pages for a richer episode.";
       }
-
+      
       // Save raw script
       const scriptPath = path.join(ctx.jobDir, "script.txt");
       fs.writeFileSync(scriptPath, scriptText, "utf8");
@@ -503,20 +536,15 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}
 
       let scriptLines;
       if (ctx.dialogue === "duet") {
-        // If lines like "Alex: ..." / "Sam: ..." exist, preserve order.
         const labeled = cleaned
           .split(/\r?\n/)
           .map((s) => s.trim())
           .filter(Boolean);
         const hasLabels = labeled.some((l) => /^alex:|^sam:/i.test(l));
-        if (hasLabels) {
-          scriptLines = labeled.map((l) => l.replace(/^(alex|sam):\s*/i, ""));
-        } else {
-          // Fallback: alternate by sentence
-          scriptLines = cleaned.split(/(?<=[.!?])\s+/).filter(Boolean);
-        }
+        scriptLines = hasLabels
+          ? labeled.map((l) => l.replace(/^(alex|sam):\s*/i, ""))
+          : cleaned.split(/(?<=[.!?])\s+/).filter(Boolean);
       } else {
-        // solo narrator — one big line is fine; Piper pauses at sentence boundaries
         scriptLines = [cleaned];
       }
 
@@ -530,17 +558,10 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}
       try {
         narrationPath = path.join(ctx.jobDir, "narration.wav");
         const voices = {
-          voiceA:
-            process.env.PIPER_VOICE_A || "/app/models/en_US-amy-medium.onnx",
-          voiceB:
-            process.env.PIPER_VOICE_B || "/app/models/en_US-ryan-high.onnx",
+          voiceA: process.env.PIPER_VOICE_A || "/app/models/en_US-amy-medium.onnx",
+          voiceB: process.env.PIPER_VOICE_B || "/app/models/en_US-ryan-high.onnx",
         };
-        await synthesizePodcast(
-          scriptLines,
-          narrationPath,
-          ctx.dialogue === "duet",
-          voices
-        );
+        await synthesizePodcast(scriptLines, narrationPath, ctx.dialogue === "duet", voices);
         log("TTS synthesis complete");
       } catch (e) {
         log("TTS synthesis failed: " + e.message);
@@ -553,14 +574,13 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}
       const vttPath = path.join(ctx.jobDir, "captions.vtt");
       fs.writeFileSync(vttPath, vtt, "utf8");
 
-      // 5) duration-aware timing & HEAVIER encoding
+      // 5) duration-aware timing & encoding
       const slides = fs
         .readdirSync(ctx.jobDir)
         .filter((f) => /^slide-.*\.png$/i.test(f))
         .sort();
       const nSlides = Math.max(1, slides.length);
 
-      // narration-aware duration
       let totalDuration = ctx.duration || 90;
       if (hasAudio) {
         const dur = getAudioDuration(narrationPath);
@@ -571,83 +591,48 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}
       }
 
       const profile = String(ctx.encodeProfile || "balanced").toLowerCase();
-
-      // Timing (slightly longer floor per slide)
       const perSlideSec = Math.max(4, Math.round(totalDuration / nSlides));
       const baseFps = profile === "insane" ? 60 : profile === "heavy" ? 48 : 30;
       const dFrames = perSlideSec * baseFps;
       const fr = 1 / perSlideSec;
 
-      // Output resolution targets (upscale to burn CPU)
-      const outW =
-        profile === "insane" ? 3840 : profile === "heavy" ? 2560 : 1920;
-      const outH =
-        profile === "insane" ? 2160 : profile === "heavy" ? 1440 : 1080;
+      const outW = profile === "insane" ? 3840 : profile === "heavy" ? 2560 : 1920;
+      const outH = profile === "insane" ? 2160 : profile === "heavy" ? 1440 : 1080;
 
-      const subtitlePathEsc = vttPath.replace(/'/g, "\\'");
       const zoom = `zoompan=z='zoom+0.001':d=${dFrames}:s=${outW}x${outH}`;
       const baseFilters = [
         zoom,
         `scale=${outW}:${outH}:flags=lanczos`,
-        // captions intentionally NOT burned into the video
         `unsharp=5:5:0.5:5:5:0.5`,
         `eq=contrast=1.05:brightness=0.02:saturation=1.05`,
         `vignette=PI/6`,
       ];
-
-      // Motion interpolation is very CPU-heavy
       if (profile !== "balanced") {
-        baseFilters.push(
-          `minterpolate='mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps=${baseFps}'`
-        );
+        baseFilters.push(`minterpolate='mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps=${baseFps}'`);
       }
       baseFilters.push(`format=yuv420p`);
       const vf = baseFilters.join(",");
+      const af = hasAudio ? `-ar 48000 -af "loudnorm=I=-16:LRA=11:TP=-1.5"` : "";
 
-      // Audio filter: normalize & resample
-      const af = hasAudio
-        ? `-ar 48000 -af "loudnorm=I=-16:LRA=11:TP=-1.5"`
-        : "";
-
-      // x264 settings
-      const preset =
-        profile === "insane"
-          ? "veryslow"
-          : profile === "heavy"
-          ? "slower"
-          : "slow";
+      const preset = profile === "insane" ? "veryslow" : profile === "heavy" ? "slower" : "slow";
       const crf = profile === "insane" ? 16 : profile === "heavy" ? 18 : 20;
 
       if (profile !== "balanced") {
-        // 2-pass to double CPU work and improve allocation
         const passlog = path.join(ctx.jobDir, "ffpass");
-        const cmd1 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${
-          ctx.jobDir
-        }/slide-*.png" ${
-          hasAudio ? `-i "${narrationPath}"` : ""
-        } -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p -an -pass 1 -passlogfile "${passlog}" -f mp4 /dev/null`;
+        const cmd1 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" ${hasAudio ? `-i "${narrationPath}"` : ""} -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p -an -pass 1 -passlogfile "${passlog}" -f mp4 /dev/null`;
         log("ENC PASS1: " + cmd1);
         const enc1 = spawn("bash", ["-lc", cmd1]);
         enc1.stdout.on("data", (d) => log(d.toString()));
         enc1.stderr.on("data", (d) => log(d.toString()));
         await new Promise((resolve) => enc1.on("close", resolve));
 
-        const cmd2 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${
-          ctx.jobDir
-        }/slide-*.png" ${
-          hasAudio ? `-i "${narrationPath}"` : ""
-        } -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p ${
-          hasAudio ? `${af} -c:a aac -b:a 192k` : ""
-        } -movflags +faststart -shortest -pass 2 -passlogfile "${passlog}" "${
-          ctx.outputPath
-        }"`;
+        const cmd2 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" ${hasAudio ? `-i "${narrationPath}"` : ""} -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p ${hasAudio ? `${af} -c:a aac -b:a 192k` : ""} -movflags +faststart -shortest -pass 2 -passlogfile "${passlog}" "${ctx.outputPath}"`;
         log("ENC PASS2: " + cmd2);
         const enc2 = spawn("bash", ["-lc", cmd2]);
         enc2.stdout.on("data", (d) => log(d.toString()));
         enc2.stderr.on("data", (d) => log(d.toString()));
         await new Promise((resolve) => enc2.on("close", resolve));
       } else {
-        // Single-pass balanced
         const cmd = hasAudio
           ? `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" -i "${narrationPath}" -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p ${af} -c:a aac -b:a 192k -movflags +faststart -shortest "${ctx.outputPath}"`
           : `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p -movflags +faststart "${ctx.outputPath}"`;
@@ -661,7 +646,8 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}
       const cpuSeconds = Math.round((Date.now() - start) / 1000);
       if (!fs.existsSync(ctx.outputPath))
         throw new Error("ffmpeg failed to produce output");
-      // NEW: write metrics.json
+
+      // metrics.json
       try {
         const outputStat = fs.statSync(ctx.outputPath);
         const metrics = {
@@ -675,18 +661,41 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}
           cpuSeconds,
           outputBytes: outputStat?.size || 0,
         };
-        fs.writeFileSync(
-          path.join(ctx.jobDir, "metrics.json"),
-          JSON.stringify(metrics, null, 2)
-        );
+        fs.writeFileSync(path.join(ctx.jobDir, "metrics.json"), JSON.stringify(metrics, null, 2));
       } catch (e) {
         log("WARN: failed to write metrics.json: " + e.message);
       }
 
+      // --- NEW: Upload to S3 (if configured) ---
+      let uploaded = false;
+      if (S3_BUCKET) {
+        try {
+          const key = s3KeyForJob(id);
+          log(`Uploading output to s3://${S3_BUCKET}/${key} ...`);
+          
+          await s3.send(new PutObjectCommand({
+            Bucket: S3_BUCKET,
+            Key: key,
+            Body: fs.createReadStream(ctx.outputPath),
+            ContentType: "video/mp4",
+            ContentDisposition: 'attachment; filename="video.mp4"',
+          }));
+          uploaded = true;
+          // persist S3 location
+          db.prepare(`UPDATE jobs SET s3Bucket=?, s3Key=? WHERE id=?`)
+            .run(S3_BUCKET, key, id);
+          log("S3 upload complete");
+        } catch (e) {
+          log("WARN: S3 upload failed: " + (e.message || String(e)));
+        }
+      }
+
+      // Finalize job
       db.prepare(
         `UPDATE jobs SET status='done', finishedAt=datetime('now'), cpuSeconds=?, outputPath=? WHERE id=?`
       ).run(cpuSeconds, ctx.outputPath, id);
-      log("JOB DONE");
+
+      log("JOB DONE" + (uploaded ? " (and uploaded to S3)" : ""));
     } catch (err) {
       const cpuSeconds = Math.round((Date.now() - start) / 1000);
       db.prepare(
