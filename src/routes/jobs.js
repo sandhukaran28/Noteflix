@@ -9,9 +9,14 @@ const fs = require("fs");
 const { spawn, spawnSync } = require("child_process");
 const { synthesizePodcast } = require("../utils/tts");
 const { fetchWikiSummary } = require("../utils/wiki");
-const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+} = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
+const { putJobEvent, getJobEvents, qutUsernameFromReqUser } = require("../ddb");
 // -------------------- paths & dirs --------------------
 const DATA_ROOT = process.env.DATA_ROOT || "./data";
 const TMP_DIR = path.join(DATA_ROOT, "tmp");
@@ -21,7 +26,10 @@ fs.mkdirSync(OUT_DIR, { recursive: true });
 
 const s3 = new S3Client({ region: process.env.AWS_REGION });
 const S3_BUCKET = process.env.S3_BUCKET;
-const S3_PREFIX = (process.env.S3_PREFIX || "noteflix/outputs").replace(/\/+$/,"");
+const S3_PREFIX = (process.env.S3_PREFIX || "noteflix/outputs").replace(
+  /\/+$/,
+  ""
+);
 
 const r = Router();
 
@@ -30,8 +38,12 @@ function s3KeyForJob(jobId) {
 }
 
 function ensureS3Columns() {
-  try { db.exec(`ALTER TABLE jobs ADD COLUMN s3Bucket TEXT`); } catch {}
-  try { db.exec(`ALTER TABLE jobs ADD COLUMN s3Key TEXT`); } catch {}
+  try {
+    db.exec(`ALTER TABLE jobs ADD COLUMN s3Bucket TEXT`);
+  } catch {}
+  try {
+    db.exec(`ALTER TABLE jobs ADD COLUMN s3Key TEXT`);
+  } catch {}
 }
 ensureS3Columns();
 
@@ -49,9 +61,10 @@ function ensureJobColumns() {
   const names = getJobTableColumns();
   const alters = [];
 
-  // These are referenced by the code below
   if (!names.has("createdAt"))
-    alters.push(`ALTER TABLE jobs ADD COLUMN createdAt TEXT DEFAULT (datetime('now'))`);
+    alters.push(
+      `ALTER TABLE jobs ADD COLUMN createdAt TEXT DEFAULT (datetime('now'))`
+    );
   if (!names.has("startedAt"))
     alters.push(`ALTER TABLE jobs ADD COLUMN startedAt TEXT`);
   if (!names.has("finishedAt"))
@@ -64,11 +77,11 @@ function ensureJobColumns() {
     alters.push(`ALTER TABLE jobs ADD COLUMN logsPath TEXT`);
 
   for (const sql of alters) {
-    try { db.exec(sql); } catch (_) {}
+    try {
+      db.exec(sql);
+    } catch (_) {}
   }
 }
-
-// Ensure columns exist at module load
 ensureJobColumns();
 
 // -------------------- shell helpers --------------------
@@ -81,7 +94,6 @@ function hasCmd(name) {
   return r.status === 0 && r.stdout.trim().length > 0;
 }
 
-// helper: get audio duration with ffprobe
 function getAudioDuration(file) {
   try {
     const out = spawnSync(
@@ -92,9 +104,7 @@ function getAudioDuration(file) {
       ],
       { encoding: "utf8" }
     );
-    if (out.status === 0) {
-      return Math.ceil(parseFloat(out.stdout.trim()));
-    }
+    if (out.status === 0) return Math.ceil(parseFloat(out.stdout.trim()));
   } catch (e) {
     return null;
   }
@@ -145,7 +155,6 @@ function makeVttFromScript(text) {
   return vtt;
 }
 
-// remove timecodes/markdown and collapse spaces for TTS
 function cleanForTTS(text) {
   return text
     .normalize("NFKD")
@@ -193,6 +202,10 @@ r.post("/process", (req, res) => {
     logsPath
   );
 
+  // Audit: job created
+  const qutUser = qutUsernameFromReqUser(user);
+  putJobEvent(id, qutUser, "pending", "Job created").catch(() => {});
+
   process.nextTick(() =>
     runJob(id, asset, {
       jobDir,
@@ -222,9 +235,8 @@ r.get("/", (req, res) => {
   const startedAfter = q.startedAfter?.trim() || null;
   const finishedBefore = q.finishedBefore?.trim() || null;
 
-  // --- sorting: supports "field:dir" AND ?order= ---
   const allowedFields = ["rowid", "createdAt", "startedAt", "finishedAt"];
-  let sortParam = (q.sort || "").toString().trim(); // e.g. "createdAt:desc" or "createdAt"
+  let sortParam = (q.sort || "").toString().trim();
   let requestedField = sortParam || "createdAt";
   let dirFromSort = "";
 
@@ -237,17 +249,19 @@ r.get("/", (req, res) => {
   const orderDir =
     (dirFromSort || q.order || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
 
-  // Only allow a safe field and one that actually exists (except rowid)
   const cols = getJobTableColumns();
   let sortField = "rowid";
   if (requestedField === "rowid") {
     sortField = "rowid";
-  } else if (allowedFields.includes(requestedField) && cols.has(requestedField)) {
+  } else if (
+    allowedFields.includes(requestedField) &&
+    cols.has(requestedField)
+  ) {
     sortField = requestedField;
   } else if (cols.has("createdAt")) {
     sortField = "createdAt";
   } else {
-    sortField = "rowid"; // robust fallback
+    sortField = "rowid";
   }
 
   const where = ["owner = @owner"];
@@ -304,6 +318,17 @@ r.get("/:id", (req, res) => {
   res.json(row);
 });
 
+// ---- new: audit endpoint (DynamoDB) ----
+r.get("/:id/audit", async (req, res) => {
+  try {
+    const qutUser = qutUsernameFromReqUser(req.user);
+    const items = await getJobEvents(req.params.id, qutUser);
+    res.json({ items });
+  } catch (e) {
+    res.status(500).json({ error: "audit read failed" });
+  }
+});
+
 // -------------------- logs --------------------
 r.get("/:id/logs", (req, res) => {
   const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
@@ -315,16 +340,13 @@ r.get("/:id/logs", (req, res) => {
 });
 
 // -------------------- output (Download) --------------------
-// at top of routes file:
-
-
 // /jobs/:id/output — prefer S3, fallback to local
 r.get("/:id/output", async (req, res) => {
   const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
   if (!row) return res.status(404).json({ error: "not found" });
 
   const bucket = row.s3Bucket || process.env.S3_BUCKET;
-  const key = row.s3Key || keyFor(row.id);
+  const key = row.s3Key || s3KeyForJob(row.id); // fixed: was keyFor
 
   if (bucket && key) {
     try {
@@ -333,19 +355,17 @@ r.get("/:id/output", async (req, res) => {
         new GetObjectCommand({
           Bucket: bucket,
           Key: key,
-          // force download filename on S3 side too (nice UX)
           ResponseContentDisposition: 'attachment; filename="video.mp4"',
         }),
-        { expiresIn: 900 } // 15 min
+        { expiresIn: 900 }
       );
-      return res.redirect(302, url); // <-- critical
+      return res.redirect(302, url);
     } catch (e) {
       console.warn("S3 presign failed:", e.message);
-      // fall-through to local file below
+      // fall through to local
     }
   }
 
-  // Local fallback
   if (!row.outputPath || !fs.existsSync(row.outputPath)) {
     return res.status(404).json({ error: "not found" });
   }
@@ -360,7 +380,8 @@ r.get("/:id/output", async (req, res) => {
     if (!m) return res.status(416).end();
     let start = m[1] ? parseInt(m[1], 10) : 0;
     let end = m[2] ? parseInt(m[2], 10) : stat.size - 1;
-    if (isNaN(start) || isNaN(end) || start > end || end >= stat.size) return res.status(416).end();
+    if (isNaN(start) || isNaN(end) || start > end || end >= stat.size)
+      return res.status(416).end();
     res.status(206);
     res.setHeader("Content-Range", `bytes ${start}-${end}/${stat.size}`);
     res.setHeader("Content-Length", String(end - start + 1));
@@ -370,7 +391,6 @@ r.get("/:id/output", async (req, res) => {
     fs.createReadStream(row.outputPath).pipe(res);
   }
 });
-
 
 // -------------------- captions (Download) --------------------
 r.get("/:id/captions", (req, res) => {
@@ -429,6 +449,13 @@ function runJob(id, asset, ctx) {
     `UPDATE jobs SET status='running', startedAt=datetime('now') WHERE id=?`
   ).run(id);
 
+  // Audit: running
+  const qutUser = qutUsernameFromReqUser({
+    email: asset.owner || undefined,
+    sub: asset.owner,
+  });
+  putJobEvent(id, qutUser, "running", "Processing started").catch(() => {});
+
   (async () => {
     try {
       // 1) PDF -> images (or copy single image)
@@ -449,7 +476,6 @@ function runJob(id, asset, ctx) {
         if (p1.status !== 0) throw new Error("copy image failed");
       }
 
-      // visibility for debugging
       const ls = sh(`ls -l "${ctx.jobDir}" | head -n 40`);
       log(ls.stdout || "");
       log(ls.stderr || "");
@@ -469,12 +495,11 @@ function runJob(id, asset, ctx) {
           }
         }
 
-        // Dynamic word target from requested duration
-        const wpm = 150; // ~2.5 words/sec
+        const wpm = 150;
         const targetSeconds = Math.max(
           30,
           Math.min(600, Number(ctx.duration || 90))
-        ); // clamp 30s–10m
+        );
         const targetWords = Math.round((wpm / 60) * targetSeconds);
 
         const duet = ctx.dialogue === "duet";
@@ -496,8 +521,14 @@ function runJob(id, asset, ctx) {
         } catch {}
 
         const prompt = `
-You are scripting a short educational podcast${duet ? " with TWO speakers (Alex and Sam)" : ""}.
-${duet ? "Write alternating lines starting with 'Alex:' and 'Sam:'." : "Write a single narrator script."}
+You are scripting a short educational podcast${
+          duet ? " with TWO speakers (Alex and Sam)" : ""
+        }.
+${
+  duet
+    ? "Write alternating lines starting with 'Alex:' and 'Sam:'."
+    : "Write a single narrator script."
+}
 
 Constraints:
 - Target length: ~${targetWords} words (≈ ${targetSeconds} seconds at ~${wpm} wpm).
@@ -515,7 +546,8 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
         log(`Calling Ollama at ${base} with model ${model} ...`);
         try {
           // scriptText = await callOllama(prompt, { base, model });
-           scriptText = "This video animates your uploaded slide. Add more pages for a richer episode."
+          scriptText =
+            "This video animates your uploaded slide. Add more pages for a richer episode.";
         } catch (e) {
           log("Ollama call failed: " + e.message);
           scriptText =
@@ -525,12 +557,11 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
         scriptText =
           "This video animates your uploaded slide. Add more pages for a richer episode.";
       }
-      
-      // Save raw script
+
       const scriptPath = path.join(ctx.jobDir, "script.txt");
       fs.writeFileSync(scriptPath, scriptText, "utf8");
 
-      // 3) TTS (solo/duet) -> narration.wav using Piper (via utils/tts)
+      // 3) TTS
       log("Cleaning script for TTS...");
       const cleaned = cleanForTTS(scriptText);
 
@@ -558,10 +589,17 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
       try {
         narrationPath = path.join(ctx.jobDir, "narration.wav");
         const voices = {
-          voiceA: process.env.PIPER_VOICE_A || "/app/models/en_US-amy-medium.onnx",
-          voiceB: process.env.PIPER_VOICE_B || "/app/models/en_US-ryan-high.onnx",
+          voiceA:
+            process.env.PIPER_VOICE_A || "/app/models/en_US-amy-medium.onnx",
+          voiceB:
+            process.env.PIPER_VOICE_B || "/app/models/en_US-ryan-high.onnx",
         };
-        await synthesizePodcast(scriptLines, narrationPath, ctx.dialogue === "duet", voices);
+        await synthesizePodcast(
+          scriptLines,
+          narrationPath,
+          ctx.dialogue === "duet",
+          voices
+        );
         log("TTS synthesis complete");
       } catch (e) {
         log("TTS synthesis failed: " + e.message);
@@ -574,7 +612,7 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
       const vttPath = path.join(ctx.jobDir, "captions.vtt");
       fs.writeFileSync(vttPath, vtt, "utf8");
 
-      // 5) duration-aware timing & encoding
+      // 5) encoding
       const slides = fs
         .readdirSync(ctx.jobDir)
         .filter((f) => /^slide-.*\.png$/i.test(f))
@@ -596,8 +634,10 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
       const dFrames = perSlideSec * baseFps;
       const fr = 1 / perSlideSec;
 
-      const outW = profile === "insane" ? 3840 : profile === "heavy" ? 2560 : 1920;
-      const outH = profile === "insane" ? 2160 : profile === "heavy" ? 1440 : 1080;
+      const outW =
+        profile === "insane" ? 3840 : profile === "heavy" ? 2560 : 1920;
+      const outH =
+        profile === "insane" ? 2160 : profile === "heavy" ? 1440 : 1080;
 
       const zoom = `zoompan=z='zoom+0.001':d=${dFrames}:s=${outW}x${outH}`;
       const baseFilters = [
@@ -608,25 +648,46 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
         `vignette=PI/6`,
       ];
       if (profile !== "balanced") {
-        baseFilters.push(`minterpolate='mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps=${baseFps}'`);
+        baseFilters.push(
+          `minterpolate='mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps=${baseFps}'`
+        );
       }
       baseFilters.push(`format=yuv420p`);
       const vf = baseFilters.join(",");
-      const af = hasAudio ? `-ar 48000 -af "loudnorm=I=-16:LRA=11:TP=-1.5"` : "";
+      const af = hasAudio
+        ? `-ar 48000 -af "loudnorm=I=-16:LRA=11:TP=-1.5"`
+        : "";
 
-      const preset = profile === "insane" ? "veryslow" : profile === "heavy" ? "slower" : "slow";
+      const preset =
+        profile === "insane"
+          ? "veryslow"
+          : profile === "heavy"
+          ? "slower"
+          : "slow";
       const crf = profile === "insane" ? 16 : profile === "heavy" ? 18 : 20;
 
       if (profile !== "balanced") {
         const passlog = path.join(ctx.jobDir, "ffpass");
-        const cmd1 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" ${hasAudio ? `-i "${narrationPath}"` : ""} -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p -an -pass 1 -passlogfile "${passlog}" -f mp4 /dev/null`;
+        const cmd1 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${
+          ctx.jobDir
+        }/slide-*.png" ${
+          hasAudio ? `-i "${narrationPath}"` : ""
+        } -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p -an -pass 1 -passlogfile "${passlog}" -f mp4 /dev/null`;
         log("ENC PASS1: " + cmd1);
         const enc1 = spawn("bash", ["-lc", cmd1]);
         enc1.stdout.on("data", (d) => log(d.toString()));
         enc1.stderr.on("data", (d) => log(d.toString()));
         await new Promise((resolve) => enc1.on("close", resolve));
 
-        const cmd2 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" ${hasAudio ? `-i "${narrationPath}"` : ""} -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p ${hasAudio ? `${af} -c:a aac -b:a 192k` : ""} -movflags +faststart -shortest -pass 2 -passlogfile "${passlog}" "${ctx.outputPath}"`;
+        const cmd2 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${
+          ctx.jobDir
+        }/slide-*.png" ${
+          hasAudio ? `-i "${narrationPath}"` : ""
+        } -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p ${
+          hasAudio ? `${af} -c:a aac -b:a 192k` : ""
+        } -movflags +faststart -shortest -pass 2 -passlogfile "${passlog}" "${
+          ctx.outputPath
+        }"`;
         log("ENC PASS2: " + cmd2);
         const enc2 = spawn("bash", ["-lc", cmd2]);
         enc2.stdout.on("data", (d) => log(d.toString()));
@@ -647,7 +708,6 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
       if (!fs.existsSync(ctx.outputPath))
         throw new Error("ffmpeg failed to produce output");
 
-      // metrics.json
       try {
         const outputStat = fs.statSync(ctx.outputPath);
         const metrics = {
@@ -661,39 +721,54 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
           cpuSeconds,
           outputBytes: outputStat?.size || 0,
         };
-        fs.writeFileSync(path.join(ctx.jobDir, "metrics.json"), JSON.stringify(metrics, null, 2));
+        fs.writeFileSync(
+          path.join(ctx.jobDir, "metrics.json"),
+          JSON.stringify(metrics, null, 2)
+        );
       } catch (e) {
         log("WARN: failed to write metrics.json: " + e.message);
       }
 
-      // --- NEW: Upload to S3 (if configured) ---
+      // Upload to S3 (if configured)
       let uploaded = false;
       if (S3_BUCKET) {
         try {
           const key = s3KeyForJob(id);
           log(`Uploading output to s3://${S3_BUCKET}/${key} ...`);
-          
-          await s3.send(new PutObjectCommand({
-            Bucket: S3_BUCKET,
-            Key: key,
-            Body: fs.createReadStream(ctx.outputPath),
-            ContentType: "video/mp4",
-            ContentDisposition: 'attachment; filename="video.mp4"',
-          }));
+
+          await s3.send(
+            new PutObjectCommand({
+              Bucket: S3_BUCKET,
+              Key: key,
+              Body: fs.createReadStream(ctx.outputPath),
+              ContentType: "video/mp4",
+              ContentDisposition: 'attachment; filename="video.mp4"',
+            })
+          );
           uploaded = true;
-          // persist S3 location
-          db.prepare(`UPDATE jobs SET s3Bucket=?, s3Key=? WHERE id=?`)
-            .run(S3_BUCKET, key, id);
+          db.prepare(`UPDATE jobs SET s3Bucket=?, s3Key=? WHERE id=?`).run(
+            S3_BUCKET,
+            key,
+            id
+          );
           log("S3 upload complete");
         } catch (e) {
           log("WARN: S3 upload failed: " + (e.message || String(e)));
         }
       }
 
-      // Finalize job
+      // Finalize
       db.prepare(
         `UPDATE jobs SET status='done', finishedAt=datetime('now'), cpuSeconds=?, outputPath=? WHERE id=?`
       ).run(cpuSeconds, ctx.outputPath, id);
+
+      // Audit: done
+      putJobEvent(
+        id,
+        qutUser,
+        "done",
+        uploaded ? "Encoding complete (uploaded to S3)" : "Encoding complete"
+      ).catch(() => {});
 
       log("JOB DONE" + (uploaded ? " (and uploaded to S3)" : ""));
     } catch (err) {
@@ -702,6 +777,10 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
         `UPDATE jobs SET status='failed', finishedAt=datetime('now'), cpuSeconds=? WHERE id=?`
       ).run(cpuSeconds, id);
       const msg = err && err.message ? err.message : String(err);
+
+      // Audit: failed
+      putJobEvent(id, qutUser, "failed", msg).catch(() => {});
+
       log("FAILED: " + msg);
     }
   })();
