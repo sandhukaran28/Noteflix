@@ -1,6 +1,7 @@
 // lib/config.js
 const { SSMClient, GetParameterCommand, GetParametersCommand } = require("@aws-sdk/client-ssm");
 const { SecretsManagerClient, GetSecretValueCommand } = require("@aws-sdk/client-secrets-manager");
+const { getWikiOAuth } = require("./wikiauth");
 
 const REGION = process.env.AWS_REGION || "ap-southeast-2";
 const STAGE = process.env.STAGE || "prod";
@@ -29,11 +30,23 @@ async function getParameters(names, withDecryption = true) {
   return results;
 }
 
+function asBool(v, fallback = false) {
+  if (v === undefined || v === null) return fallback;
+  const s = String(v).trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "on";
+}
+
+function asNum(v, fallback) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 async function loadConfig() {
   if (cached) return cached;
 
   // Declare the exact parameter names we need
   const names = [
+    // core
     `${BASE}/aws/region`,
     `${BASE}/api/basePath`,
     `${BASE}/cognito/userPoolId`,
@@ -42,6 +55,14 @@ async function loadConfig() {
     `${BASE}/s3/prefix`,
     `${BASE}/ddb/table`,
     `${BASE}/qut/username`,
+
+    // wiki feature
+    `${BASE}/wiki/enabled`,
+    `${BASE}/wiki/lang`,
+    `${BASE}/wiki/maxChars`,
+    `${BASE}/wiki/cacheTtlSeconds`,
+    `${BASE}/wiki/apiBase`,
+    `${BASE}/wiki/oauth/tokenUrl`,
   ];
 
   let params = {};
@@ -51,7 +72,7 @@ async function loadConfig() {
     console.warn("[config] GetParameters failed; falling back to envs. Reason:", e?.name || e?.__type || e?.message || e);
   }
 
-  // Optional secret (guarded)
+  // Optional secret (example kept from your file)
   const secrets = {};
   try {
     const sec = await sm.send(
@@ -60,8 +81,17 @@ async function loadConfig() {
     if (sec.SecretString) secrets.serviceX = JSON.parse(sec.SecretString);
   } catch { /* optional */ }
 
+  // Wiki OAuth (from Secrets Manager via helper; falls back to SSM SecureString inside helper if you set it that way)
+  try {
+    const wikiOAuth = await getWikiOAuth(); // { clientId, clientSecret } or null
+    if (wikiOAuth) secrets.wikiOAuth = wikiOAuth;
+  } catch { /* optional */ }
+
+  // Map to config object with sensible env fallbacks
+  const awsRegion = params[`${BASE}/aws/region`] || process.env.AWS_REGION || REGION;
+
   cached = {
-    awsRegion: params[`${BASE}/aws/region`] || process.env.AWS_REGION || REGION,
+    awsRegion,
     apiBasePath: params[`${BASE}/api/basePath`] || process.env.API_BASE_PATH || "/api/v1",
     cognito: {
       userPoolId: params[`${BASE}/cognito/userPoolId`] || process.env.COGNITO_USER_POOL_ID || "",
@@ -76,6 +106,14 @@ async function loadConfig() {
     },
     qut: {
       username: params[`${BASE}/qut/username`] || process.env.QUT_USERNAME || "",
+    },
+    wiki: {
+      enabled: asBool(params[`${BASE}/wiki/enabled`] ?? process.env.WIKI_ENABLED, false),
+      lang: params[`${BASE}/wiki/lang`] || process.env.WIKI_LANG || "en",
+      maxChars: asNum(params[`${BASE}/wiki/maxChars`] ?? process.env.WIKI_MAX_CHARS, 1200),
+      cacheTtlSeconds: asNum(params[`${BASE}/wiki/cacheTtlSeconds`] ?? process.env.WIKI_CACHE_TTL, 2592000),
+      apiBase: params[`${BASE}/wiki/apiBase`] || process.env.WIKI_API_BASE || "",
+      tokenUrl: params[`${BASE}/wiki/oauth/tokenUrl`] || process.env.WIKI_TOKEN_URL || "",
     },
     secrets,
   };

@@ -8,6 +8,7 @@ const assets = require("./routes/assets");
 const jobs = require("./routes/jobs");
 const { auth } = require("./middleware/auth"); // Cognito verifier middleware
 const { loadConfig, getConfig } = require("./lib/config"); // <-- add this
+const { fetchWikiSummary } = require("./utils/wiki");
 
 (async () => {
   // 1) Load config from SSM/Secrets once at boot
@@ -54,11 +55,6 @@ const { loadConfig, getConfig } = require("./lib/config"); // <-- add this
   app.use("/api/v1/jobs", auth(true), jobs);
 
   app.get("/healthz", (_, res) => res.json({ ok: true }));
-
-  app.get("/debug/config", (_req, res) => {
-  const { cognito } = require("./lib/config").getConfig();
-  res.json({ userPoolId: cognito.userPoolId, clientId: cognito.clientId });
-});
 
   const PORT = Number(process.env.PORT || 8080);
   app.listen(PORT, () => console.log(`NoteFlix Server on :${PORT}`));
