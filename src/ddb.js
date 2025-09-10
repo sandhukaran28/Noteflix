@@ -13,10 +13,26 @@ const DDB_TABLE = process.env.DDB_TABLE || "n11845619-noteflix";
 const DDB_PK_NAME = "qut-username";
 
 // Helper: derive the QUT username for the PK value
+// src/lib/qut.js
+const { getConfig } = require("./lib/config");
+
 function qutUsernameFromReqUser(user) {
-  // Prefer an email-like ID if available; fall back to env
-  return (process.env.QUT_USERNAME || "").toString();
+  console.log("user",user);
+  try {
+    const cfg = getConfig();
+    if (cfg?.qut?.username) return String(cfg.qut.username).toLowerCase();
+  } catch (_) {
+    // config not loaded yet; fall through to env
+  }
+
+  if (process.env.QUT_USERNAME) {
+    return String(process.env.QUT_USERNAME).toLowerCase();
+  }
+
+  throw new Error("QUT username not configured (missing in SSM and env).");
 }
+
+
 
 // Write an audit event
 async function putJobEvent(jobId, qutUsername, status, message = "") {

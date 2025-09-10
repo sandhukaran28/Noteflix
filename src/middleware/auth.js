@@ -1,36 +1,58 @@
 // backend/src/middleware/auth.js
-require("dotenv").config();
 const { CognitoJwtVerifier } = require("aws-jwt-verify");
+const { getConfig } = require("../lib/config");
 
-const idVerifier = CognitoJwtVerifier.create({
-  userPoolId: process.env.COGNITO_USER_POOL_ID,
-  tokenUse: "id",                         // <-- expect ID tokens
-  clientId: process.env.COGNITO_CLIENT_ID,
-});
+let idVerifier; // cached singleton
+
+function assertString(name, val) {
+  if (typeof val !== "string" || !val.trim()) {
+    throw new Error(`${name} is missing/empty`);
+  }
+}
+
+function getVerifier() {
+  if (!idVerifier) {
+    const cfg = getConfig(); // must be loaded at server startup
+    const userPoolId = cfg?.cognito?.userPoolId || process.env.COGNITO_USER_POOL_ID;
+    const clientId   = cfg?.cognito?.clientId   || process.env.COGNITO_CLIENT_ID;
+
+    // HARD ASSERTS so we fail loudly + clearly (instead of ".match" crash)
+    assertString("COGNITO_USER_POOL_ID", userPoolId);
+    assertString("COGNITO_CLIENT_ID", clientId);
+
+    console.log("[auth] Using Cognito pool:", userPoolId, "clientId:", clientId);
+    idVerifier = CognitoJwtVerifier.create({
+      userPoolId,
+      clientId,
+      tokenUse: "id",
+    });
+  }
+  return idVerifier;
+}
 
 function auth(required = true) {
   return async (req, res, next) => {
     const hdr = req.headers.authorization || "";
     let token = hdr.startsWith("Bearer ") ? hdr.slice(7) : "";
     if (!token && req.cookies?.nf_id) token = req.cookies.nf_id;
+
     if (!token) {
       if (required) return res.status(401).json({ error: "unauthorized" });
       req.user = null; return next();
     }
 
     try {
-      const payload = await idVerifier.verify(token);
-
+      const payload = await getVerifier().verify(token);
       req.user = {
         sub: payload.sub,
         username: payload["cognito:username"] || payload.username,
-        email: payload.email || null,                     // present on ID tokens
+        email: payload.email || null,
         groups: payload["cognito:groups"] || [],
-        scope: payload.scope || "",                      // usually not on ID tokens
+        scope: payload.scope || "",
       };
       next();
     } catch (e) {
-      console.log("jwt verify failed:", e?.message || e);
+      console.error("jwt verify failed:", e?.message || e);
       if (required) return res.status(401).json({ error: "unauthorized" });
       req.user = null; next();
     }
