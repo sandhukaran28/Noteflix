@@ -16,6 +16,14 @@ const {
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const {
+  getJSON,
+  setJSON,
+  getVersion,
+  bumpVersion,
+  stableKeyFromObject,
+} = require("../lib/cache");
+
+const {
   DDB_PK_NAME,
   sks,
   putItem,
@@ -161,9 +169,11 @@ r.post("/process", async (req, res) => {
       s3Key: null,
     };
     await putItem(jobItem);
+    await bumpVersion("jobs", qutUser);
 
     // Audit: job created
     putJobEvent(id, qutUser, "pending", "Job created").catch(() => {});
+    await bumpVersion("audit", qutUser);
 
     process.nextTick(() =>
       runJob(id, asset, {
@@ -199,6 +209,25 @@ r.get("/", async (req, res) => {
     const assetId = q.assetId?.trim() || null;
     const startedAfter = q.startedAfter?.trim() || null;
     const finishedBefore = q.finishedBefore?.trim() || null;
+
+    // ---- cache first
+    const ver = await getVersion("jobs", qutUser);
+    const listKey = `jobs:list:${qutUser}:v${ver}:${stableKeyFromObject({
+      limit,
+      offset,
+      status,
+      assetId,
+      startedAfter,
+      finishedBefore,
+      sort: q.sort,
+      order: q.order,
+    })}`;
+    const cached = await getJSON(listKey);
+    if (cached) {
+      res.setHeader("X-Cache", "HIT");
+      res.setHeader("X-Total-Count", String(cached.totalItems ?? 0));
+      return res.json(cached);
+    }
 
     let items = await queryByPrefix(qutUser, "JOB#");
     items = items.filter((it) => it.entity === "job");
@@ -238,14 +267,18 @@ r.get("/", async (req, res) => {
     const totalPages = Math.ceil(total / limit);
     const paged = items.slice(offset, offset + limit);
 
-    res.setHeader("X-Total-Count", String(total));
-    res.json({
+    const payload = {
       totalItems: total,
       page: Math.floor(offset / limit) + 1,
       pageSize: limit,
       totalPages,
       items: paged,
-    });
+    };
+
+    await setJSON(listKey, payload, 60);
+    res.setHeader("X-Total-Count", String(total));
+    res.setHeader("X-Cache", "MISS");
+    res.json(payload);
   } catch (e) {
     console.error("jobs LIST failed:", e);
     res.status(500).json({ error: "list failed" });
@@ -256,7 +289,19 @@ r.get("/:id", async (req, res) => {
   try {
     const user = req.user;
     const qutUser = qutUsernameFromReqUser(user);
-    const row = await getItem(qutUser, sks.job(req.params.id));
+
+    const ver = await getVersion("jobs", qutUser);
+    const key = `jobs:detail:${qutUser}:v${ver}:${req.params.id}`;
+
+    let row = await getJSON(key);
+    if (!row) {
+      row = await getItem(qutUser, sks.job(req.params.id));
+      if (row) await setJSON(key, row, 60);
+      res.setHeader("X-Cache", "MISS");
+    } else {
+      res.setHeader("X-Cache", "HIT");
+    }
+
     if (!row) return res.status(404).json({ error: "not found" });
     res.json(row);
   } catch (e) {
@@ -268,8 +313,21 @@ r.get("/:id", async (req, res) => {
 r.get("/:id/audit", async (req, res) => {
   try {
     const qutUser = qutUsernameFromReqUser(req.user);
-    const items = await getJobEvents(req.params.id, qutUser);
-    res.json({ items });
+
+    const ver = await getVersion("audit", qutUser);
+    const key = `jobs:audit:${qutUser}:v${ver}:${req.params.id}`;
+
+    let payload = await getJSON(key);
+    if (!payload) {
+      const items = await getJobEvents(req.params.id, qutUser);
+      payload = { items };
+      await setJSON(key, payload, 30);
+      res.setHeader("X-Cache", "MISS");
+    } else {
+      res.setHeader("X-Cache", "HIT");
+    }
+
+    res.json(payload);
   } catch (e) {
     res.status(500).json({ error: "audit read failed" });
   }
@@ -399,9 +457,11 @@ async function runJob(id, asset, ctx) {
     { "#status": "status", "#startedAt": "startedAt" },
     { ":s": "running", ":t": new Date().toISOString() }
   );
+  await bumpVersion("jobs", ctx.qutUser);
 
   // Audit: running
   putJobEvent(id, ctx.qutUser, "running", "Processing started").catch(() => {});
+  await bumpVersion("audit", ctx.qutUser);
 
   (async () => {
     try {
@@ -658,6 +718,7 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
           ":out": ctx.outputPath,
         }
       );
+      await bumpVersion("jobs", ctx.qutUser);
 
       // Audit: done
       putJobEvent(
@@ -666,6 +727,7 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
         "done",
         uploaded ? "Encoding complete (uploaded to S3)" : "Encoding complete"
       ).catch(() => {});
+      await bumpVersion("audit", ctx.qutUser);
 
       log("JOB DONE" + (uploaded ? " (and uploaded to S3)" : ""));
     } catch (err) {
@@ -677,7 +739,9 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
         { "#status": "status", "#finishedAt": "finishedAt", "#cpuSeconds": "cpuSeconds" },
         { ":st": "failed", ":fin": new Date().toISOString(), ":cpu": Math.round((Date.now() - start) / 1000) }
       );
+      await bumpVersion("jobs", ctx.qutUser);
       putJobEvent(id, ctx.qutUser, "failed", msg).catch(() => {});
+      await bumpVersion("audit", ctx.qutUser);
       log("FAILED: " + msg);
     }
   })();
