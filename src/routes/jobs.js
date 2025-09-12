@@ -2,7 +2,6 @@
 "use strict";
 
 const { Router } = require("express");
-const { db } = require("../db");
 const { v4: uuid } = require("uuid");
 const path = require("path");
 const fs = require("fs");
@@ -16,7 +15,18 @@ const {
 } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
-const { putJobEvent, getJobEvents, qutUsernameFromReqUser } = require("../ddb");
+const {
+  DDB_PK_NAME,
+  sks,
+  putItem,
+  getItem,
+  updateItem,
+  queryByPrefix,
+  qutUsernameFromReqUser,
+  putJobEvent,
+  getJobEvents,
+} = require("../ddb");
+
 // -------------------- paths & dirs --------------------
 const DATA_ROOT = process.env.DATA_ROOT || "./data";
 const TMP_DIR = path.join(DATA_ROOT, "tmp");
@@ -24,65 +34,15 @@ const OUT_DIR = path.join(DATA_ROOT, "outputs");
 fs.mkdirSync(TMP_DIR, { recursive: true });
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
-const s3 = new S3Client({ region: process.env.AWS_REGION });
+const s3 = new S3Client({ region: process.env.AWS_REGION || "ap-southeast-2" });
 const S3_BUCKET = process.env.S3_BUCKET;
-const S3_PREFIX = (process.env.S3_PREFIX || "noteflix/outputs").replace(
-  /\/+$/,
-  ""
-);
+const S3_PREFIX = (process.env.S3_PREFIX || "noteflix/outputs").replace(/\/+$/, "");
 
 const r = Router();
 
 function s3KeyForJob(jobId) {
   return `${S3_PREFIX}/${jobId}/video.mp4`;
 }
-
-function ensureS3Columns() {
-  try {
-    db.exec(`ALTER TABLE jobs ADD COLUMN s3Bucket TEXT`);
-  } catch {}
-  try {
-    db.exec(`ALTER TABLE jobs ADD COLUMN s3Key TEXT`);
-  } catch {}
-}
-ensureS3Columns();
-
-// -------------------- schema helpers --------------------
-function getJobTableColumns() {
-  try {
-    const cols = db.prepare(`PRAGMA table_info(jobs)`).all();
-    return new Set(cols.map((c) => c.name));
-  } catch {
-    return new Set();
-  }
-}
-
-function ensureJobColumns() {
-  const names = getJobTableColumns();
-  const alters = [];
-
-  if (!names.has("createdAt"))
-    alters.push(
-      `ALTER TABLE jobs ADD COLUMN createdAt TEXT DEFAULT (datetime('now'))`
-    );
-  if (!names.has("startedAt"))
-    alters.push(`ALTER TABLE jobs ADD COLUMN startedAt TEXT`);
-  if (!names.has("finishedAt"))
-    alters.push(`ALTER TABLE jobs ADD COLUMN finishedAt TEXT`);
-  if (!names.has("cpuSeconds"))
-    alters.push(`ALTER TABLE jobs ADD COLUMN cpuSeconds INTEGER`);
-  if (!names.has("outputPath"))
-    alters.push(`ALTER TABLE jobs ADD COLUMN outputPath TEXT`);
-  if (!names.has("logsPath"))
-    alters.push(`ALTER TABLE jobs ADD COLUMN logsPath TEXT`);
-
-  for (const sql of alters) {
-    try {
-      db.exec(sql);
-    } catch (_) {}
-  }
-}
-ensureJobColumns();
 
 // -------------------- shell helpers --------------------
 function sh(cmd, opts = {}) {
@@ -98,32 +58,18 @@ function getAudioDuration(file) {
   try {
     const out = spawnSync(
       "bash",
-      [
-        "-lc",
-        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${file}"`,
-      ],
+      ["-lc", `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${file}"`],
       { encoding: "utf8" }
     );
     if (out.status === 0) return Math.ceil(parseFloat(out.stdout.trim()));
-  } catch (e) {
-    return null;
-  }
+  } catch (e) {}
   return null;
 }
 
 async function callOllama(prompt, { base, model }) {
   const url = `${base || "http://localhost:11434"}/api/generate`;
-  const body = {
-    model: model || "llama3",
-    prompt,
-    stream: false,
-    options: { temperature: 0.6 },
-  };
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const body = { model: model || "llama3", prompt, stream: false, options: { temperature: 0.6 } };
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   if (!res.ok) throw new Error(`Ollama HTTP ${res.status}`);
   const json = await res.json();
   return json.response;
@@ -170,155 +116,155 @@ function cleanForTTS(text) {
 }
 
 // -------------------- create job --------------------
-r.post("/process", (req, res) => {
-  const user = req.user;
-  const {
-    assetId,
-    style = "kenburns",
-    duration = 90,
-    dialogue = "solo",
-    encodeProfile = "balanced",
-  } = req.body || {};
+r.post("/process", async (req, res) => {
+  try {
+    const user = req.user;
+    const {
+      assetId,
+      style = "kenburns",
+      duration = 90,
+      dialogue = "solo",
+      encodeProfile = "balanced",
+    } = req.body || {};
 
-  const asset = db.prepare(`SELECT * FROM assets WHERE id = ?`).get(assetId);
-  if (!asset) return res.status(400).json({ error: "invalid assetId" });
+    const qutUser = qutUsernameFromReqUser(user);
 
-  const id = uuid();
-  const jobDir = path.join(TMP_DIR, id);
-  const logsPath = path.join(jobDir, "logs.txt");
-  const outDir = path.join(OUT_DIR, id);
-  const outputPath = path.join(outDir, "video.mp4");
-  fs.mkdirSync(jobDir, { recursive: true });
-  fs.mkdirSync(outDir, { recursive: true });
+    // Load asset (from DDB)
+    const asset = await getItem(qutUser, sks.asset(assetId));
+    if (!asset) return res.status(400).json({ error: "invalid assetId" });
 
-  db.prepare(
-    `INSERT INTO jobs(id, assetId, owner, params, status, logsPath)
-     VALUES(?, ?, ?, ?, 'pending', ?)`
-  ).run(
-    id,
-    assetId,
-    user?.sub || "unknown",
-    JSON.stringify({ style, duration, dialogue, encodeProfile }),
-    logsPath
-  );
+    const id = uuid();
+    const jobDir = path.join(TMP_DIR, id);
+    const logsPath = path.join(jobDir, "logs.txt");
+    const outDir = path.join(OUT_DIR, id);
+    const outputPath = path.join(outDir, "video.mp4");
+    fs.mkdirSync(jobDir, { recursive: true });
+    fs.mkdirSync(outDir, { recursive: true });
 
-  // Audit: job created
-  const qutUser = qutUsernameFromReqUser(user);
-  putJobEvent(id, qutUser, "pending", "Job created").catch(() => {});
-
-  process.nextTick(() =>
-    runJob(id, asset, {
-      jobDir,
-      outDir,
-      outputPath,
+    const now = new Date().toISOString();
+    const jobItem = {
+      [DDB_PK_NAME]: qutUser,
+      sk: sks.job(id),
+      entity: "job",
+      id,
+      assetId,
+      owner: user?.sub || "unknown",
+      params: { style, duration, dialogue, encodeProfile },
+      status: "pending",
+      createdAt: now,
+      startedAt: null,
+      finishedAt: null,
+      cpuSeconds: 0,
+      outputPath: null,
       logsPath,
-      duration,
-      dialogue,
-      encodeProfile,
-    })
-  );
+      s3Bucket: null,
+      s3Key: null,
+    };
+    await putItem(jobItem);
 
-  res.json({ jobId: id });
+    // Audit: job created
+    putJobEvent(id, qutUser, "pending", "Job created").catch(() => {});
+
+    process.nextTick(() =>
+      runJob(id, asset, {
+        qutUser,
+        jobDir,
+        outDir,
+        outputPath,
+        logsPath,
+        duration,
+        dialogue,
+        encodeProfile,
+      })
+    );
+
+    res.json({ jobId: id });
+  } catch (e) {
+    console.error("jobs POST /process failed:", e);
+    res.status(500).json({ error: "failed to create job" });
+  }
 });
 
 // -------------------- list + details --------------------
-r.get("/", (req, res) => {
-  const user = req.user;
-  const q = req.query || {};
+r.get("/", async (req, res) => {
+  try {
+    const user = req.user;
+    const qutUser = qutUsernameFromReqUser(user);
+    const q = req.query || {};
 
-  const limit = Math.max(1, Math.min(100, parseInt(q.limit, 10) || 20));
-  const offset = Math.max(0, parseInt(q.offset, 10) || 0);
+    const limit = Math.max(1, Math.min(100, parseInt(q.limit, 10) || 20));
+    const offset = Math.max(0, parseInt(q.offset, 10) || 0);
 
-  const status =
-    typeof q.status === "string" && q.status.trim() ? q.status.trim() : null;
-  const assetId = q.assetId?.trim() || null;
-  const startedAfter = q.startedAfter?.trim() || null;
-  const finishedBefore = q.finishedBefore?.trim() || null;
+    const status = typeof q.status === "string" && q.status.trim() ? q.status.trim() : null;
+    const assetId = q.assetId?.trim() || null;
+    const startedAfter = q.startedAfter?.trim() || null;
+    const finishedBefore = q.finishedBefore?.trim() || null;
 
-  const allowedFields = ["rowid", "createdAt", "startedAt", "finishedAt"];
-  let sortParam = (q.sort || "").toString().trim();
-  let requestedField = sortParam || "createdAt";
-  let dirFromSort = "";
+    let items = await queryByPrefix(qutUser, "JOB#");
+    items = items.filter((it) => it.entity === "job");
 
-  if (sortParam.includes(":")) {
-    const [f, d] = sortParam.split(":");
-    requestedField = (f || "").trim() || "createdAt";
-    dirFromSort = (d || "").trim();
+    // Filters
+    if (status) items = items.filter((it) => it.status === status);
+    if (assetId) items = items.filter((it) => it.assetId === assetId);
+    if (startedAfter) items = items.filter((it) => (it.startedAt || "") >= startedAfter);
+    if (finishedBefore) items = items.filter((it) => (it.finishedAt || "") <= finishedBefore);
+
+    // Sorting (mirror old behavior)
+    const allowedFields = ["rowid", "createdAt", "startedAt", "finishedAt"];
+    let sortParam = (q.sort || "").toString().trim();
+    let requestedField = sortParam || "createdAt";
+    let dirFromSort = "";
+
+    if (sortParam.includes(":")) {
+      const [f, d] = sortParam.split(":");
+      requestedField = (f || "").trim() || "createdAt";
+      dirFromSort = (d || "").trim();
+    }
+    const orderDir = (dirFromSort || q.order || "desc").toLowerCase() === "asc" ? "asc" : "desc";
+
+    let sortField = "createdAt";
+    if (requestedField === "rowid") sortField = "sk";
+    else if (allowedFields.includes(requestedField)) sortField = requestedField;
+
+    items.sort((a, b) => {
+      const av = a[sortField] ?? "";
+      const bv = b[sortField] ?? "";
+      if (av < bv) return orderDir === "asc" ? -1 : 1;
+      if (av > bv) return orderDir === "asc" ? 1 : -1;
+      return 0;
+    });
+
+    const total = items.length;
+    const totalPages = Math.ceil(total / limit);
+    const paged = items.slice(offset, offset + limit);
+
+    res.setHeader("X-Total-Count", String(total));
+    res.json({
+      totalItems: total,
+      page: Math.floor(offset / limit) + 1,
+      pageSize: limit,
+      totalPages,
+      items: paged,
+    });
+  } catch (e) {
+    console.error("jobs LIST failed:", e);
+    res.status(500).json({ error: "list failed" });
   }
-
-  const orderDir =
-    (dirFromSort || q.order || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
-
-  const cols = getJobTableColumns();
-  let sortField = "rowid";
-  if (requestedField === "rowid") {
-    sortField = "rowid";
-  } else if (
-    allowedFields.includes(requestedField) &&
-    cols.has(requestedField)
-  ) {
-    sortField = requestedField;
-  } else if (cols.has("createdAt")) {
-    sortField = "createdAt";
-  } else {
-    sortField = "rowid";
-  }
-
-  const where = ["owner = @owner"];
-  const params = { owner: user?.sub || "unknown" };
-  if (status) {
-    where.push("status = @status");
-    params.status = status;
-  }
-  if (assetId) {
-    where.push("assetId = @assetId");
-    params.assetId = assetId;
-  }
-  if (startedAfter) {
-    where.push("datetime(startedAt) >= datetime(@startedAfter)");
-    params.startedAfter = startedAfter;
-  }
-  if (finishedBefore) {
-    where.push("datetime(finishedAt) <= datetime(@finishedBefore)");
-    params.finishedBefore = finishedBefore;
-  }
-
-  const whereSql = where.join(" AND ");
-  const countRow = db
-    .prepare(`SELECT COUNT(*) as cnt FROM jobs WHERE ${whereSql}`)
-    .get(params);
-  const total = countRow?.cnt || 0;
-  const totalPages = Math.ceil(total / limit);
-
-  params.limit = limit;
-  params.offset = offset;
-
-  const rows = db
-    .prepare(
-      `SELECT * FROM jobs
-       WHERE ${whereSql}
-       ORDER BY ${sortField} ${orderDir}
-       LIMIT @limit OFFSET @offset`
-    )
-    .all(params);
-
-  res.setHeader("X-Total-Count", String(total));
-  res.json({
-    totalItems: total,
-    page: Math.floor(offset / limit) + 1,
-    pageSize: limit,
-    totalPages,
-    items: rows,
-  });
 });
 
-r.get("/:id", (req, res) => {
-  const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
-  if (!row) return res.status(404).json({ error: "not found" });
-  res.json(row);
+r.get("/:id", async (req, res) => {
+  try {
+    const user = req.user;
+    const qutUser = qutUsernameFromReqUser(user);
+    const row = await getItem(qutUser, sks.job(req.params.id));
+    if (!row) return res.status(404).json({ error: "not found" });
+    res.json(row);
+  } catch (e) {
+    res.status(500).json({ error: "read failed" });
+  }
 });
 
-// ---- new: audit endpoint (DynamoDB) ----
+// ---- audit (DynamoDB) ----
 r.get("/:id/audit", async (req, res) => {
   try {
     const qutUser = qutUsernameFromReqUser(req.user);
@@ -330,23 +276,23 @@ r.get("/:id/audit", async (req, res) => {
 });
 
 // -------------------- logs --------------------
-r.get("/:id/logs", (req, res) => {
-  const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
-  if (!row || !row.logsPath)
-    return res.status(404).json({ error: "not found" });
+r.get("/:id/logs", async (req, res) => {
+  const qutUser = qutUsernameFromReqUser(req.user);
+  const row = await getItem(qutUser, sks.job(req.params.id));
+  if (!row || !row.logsPath) return res.status(404).json({ error: "not found" });
   if (!fs.existsSync(row.logsPath)) return res.status(200).send("");
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   fs.createReadStream(row.logsPath).pipe(res);
 });
 
 // -------------------- output (Download) --------------------
-// /jobs/:id/output — prefer S3, fallback to local
 r.get("/:id/output", async (req, res) => {
-  const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
+  const qutUser = qutUsernameFromReqUser(req.user);
+  const row = await getItem(qutUser, sks.job(req.params.id));
   if (!row) return res.status(404).json({ error: "not found" });
 
   const bucket = row.s3Bucket || process.env.S3_BUCKET;
-  const key = row.s3Key || s3KeyForJob(row.id); // fixed: was keyFor
+  const key = row.s3Key || s3KeyForJob(row.id);
 
   if (bucket && key) {
     try {
@@ -362,7 +308,7 @@ r.get("/:id/output", async (req, res) => {
       return res.redirect(302, url);
     } catch (e) {
       console.warn("S3 presign failed:", e.message);
-      // fall through to local
+      // fall back to local path
     }
   }
 
@@ -380,8 +326,7 @@ r.get("/:id/output", async (req, res) => {
     if (!m) return res.status(416).end();
     let start = m[1] ? parseInt(m[1], 10) : 0;
     let end = m[2] ? parseInt(m[2], 10) : stat.size - 1;
-    if (isNaN(start) || isNaN(end) || start > end || end >= stat.size)
-      return res.status(416).end();
+    if (isNaN(start) || isNaN(end) || start > end || end >= stat.size) return res.status(416).end();
     res.status(206);
     res.setHeader("Content-Range", `bytes ${start}-${end}/${stat.size}`);
     res.setHeader("Content-Length", String(end - start + 1));
@@ -392,48 +337,48 @@ r.get("/:id/output", async (req, res) => {
   }
 });
 
-// -------------------- captions (Download) --------------------
-r.get("/:id/captions", (req, res) => {
-  const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
+// -------------------- captions --------------------
+r.get("/:id/captions", async (req, res) => {
+  const qutUser = qutUsernameFromReqUser(req.user);
+  const row = await getItem(qutUser, sks.job(req.params.id));
   if (!row) return res.status(404).json({ error: "not found" });
   const jobDir = row.logsPath ? path.dirname(row.logsPath) : null;
   if (!jobDir) return res.status(404).json({ error: "not found" });
 
   const vttPath = path.join(jobDir, "captions.vtt");
-  if (!fs.existsSync(vttPath))
-    return res.status(404).json({ error: "no captions" });
+  if (!fs.existsSync(vttPath)) return res.status(404).json({ error: "no captions" });
 
   res.setHeader("Content-Type", "text/vtt; charset=utf-8");
   res.setHeader("Content-Disposition", "attachment; filename=captions.vtt");
   fs.createReadStream(vttPath).pipe(res);
 });
 
-// -------------------- script (Download) --------------------
-r.get("/:id/script", (req, res) => {
-  const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
+// -------------------- script --------------------
+r.get("/:id/script", async (req, res) => {
+  const qutUser = qutUsernameFromReqUser(req.user);
+  const row = await getItem(qutUser, sks.job(req.params.id));
   if (!row) return res.status(404).json({ error: "not found" });
   const jobDir = row.logsPath ? path.dirname(row.logsPath) : null;
   if (!jobDir) return res.status(404).json({ error: "not found" });
 
   const scriptPath = path.join(jobDir, "script.txt");
-  if (!fs.existsSync(scriptPath))
-    return res.status(404).json({ error: "no script" });
+  if (!fs.existsSync(scriptPath)) return res.status(404).json({ error: "no script" });
 
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.setHeader("Content-Disposition", "attachment; filename=script.txt");
   fs.createReadStream(scriptPath).pipe(res);
 });
 
-// -------------------- metrics (JSON) --------------------
-r.get("/:id/metrics", (req, res) => {
-  const row = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
+// -------------------- metrics --------------------
+r.get("/:id/metrics", async (req, res) => {
+  const qutUser = qutUsernameFromReqUser(req.user);
+  const row = await getItem(qutUser, sks.job(req.params.id));
   if (!row) return res.status(404).json({ error: "not found" });
   const jobDir = row.logsPath ? path.dirname(row.logsPath) : null;
   if (!jobDir) return res.status(404).json({ error: "not found" });
 
   const metricsPath = path.join(jobDir, "metrics.json");
-  if (!fs.existsSync(metricsPath))
-    return res.status(404).json({ error: "no metrics" });
+  if (!fs.existsSync(metricsPath)) return res.status(404).json({ error: "no metrics" });
 
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   fs.createReadStream(metricsPath).pipe(res);
@@ -442,32 +387,30 @@ r.get("/:id/metrics", (req, res) => {
 module.exports = r;
 
 // -------------------- worker --------------------
-function runJob(id, asset, ctx) {
+async function runJob(id, asset, ctx) {
   const log = (s) => fs.appendFileSync(ctx.logsPath, s + "\n");
   const start = Date.now();
-  db.prepare(
-    `UPDATE jobs SET status='running', startedAt=datetime('now') WHERE id=?`
-  ).run(id);
+
+  // mark running
+  await updateItem(
+    ctx.qutUser,
+    sks.job(id),
+    "SET #status = :s, #startedAt = :t",
+    { "#status": "status", "#startedAt": "startedAt" },
+    { ":s": "running", ":t": new Date().toISOString() }
+  );
 
   // Audit: running
-  const qutUser = qutUsernameFromReqUser({
-    email: asset.owner || undefined,
-    sub: asset.owner,
-  });
-  putJobEvent(id, qutUser, "running", "Processing started").catch(() => {});
+  putJobEvent(id, ctx.qutUser, "running", "Processing started").catch(() => {});
 
   (async () => {
     try {
       // 1) PDF -> images (or copy single image)
       const isPdf = asset.type === "pdf";
       if (isPdf) {
-        if (!hasCmd("pdftoppm"))
-          throw new Error("pdftoppm not found (install poppler-utils)");
-        const p1 = sh(
-          `mkdir -p "${ctx.jobDir}" && pdftoppm -png "${asset.path}" "${ctx.jobDir}/slide"`
-        );
-        log(p1.stdout || "");
-        log(p1.stderr || "");
+        if (!hasCmd("pdftoppm")) throw new Error("pdftoppm not found (install poppler-utils)");
+        const p1 = sh(`mkdir -p "${ctx.jobDir}" && pdftoppm -png "${asset.path}" "${ctx.jobDir}/slide"`);
+        log(p1.stdout || ""); log(p1.stderr || "");
         if (p1.status !== 0) throw new Error("pdf->images failed");
       } else {
         sh(`mkdir -p "${ctx.jobDir}"`);
@@ -477,14 +420,12 @@ function runJob(id, asset, ctx) {
       }
 
       const ls = sh(`ls -l "${ctx.jobDir}" | head -n 40`);
-      log(ls.stdout || "");
-      log(ls.stderr || "");
+      log(ls.stdout || ""); log(ls.stderr || "");
 
       // 2) Extract text + Ollama script (duration-aware)
       let scriptText = "";
       if (isPdf) {
-        if (!hasCmd("pdftotext"))
-          log("WARN: pdftotext not found; using fallback summary prompt.");
+        if (!hasCmd("pdftotext")) log("WARN: pdftotext not found; using fallback summary prompt.");
         let notes = "";
         if (hasCmd("pdftotext")) {
           const textPath = path.join(ctx.jobDir, "notes.txt");
@@ -496,10 +437,7 @@ function runJob(id, asset, ctx) {
         }
 
         const wpm = 150;
-        const targetSeconds = Math.max(
-          30,
-          Math.min(600, Number(ctx.duration || 90))
-        );
+        const targetSeconds = Math.max(30, Math.min(600, Number(ctx.duration || 90)));
         const targetWords = Math.round((wpm / 60) * targetSeconds);
 
         const duet = ctx.dialogue === "duet";
@@ -509,11 +447,9 @@ function runJob(id, asset, ctx) {
         try {
           const orig = (() => {
             try {
-              const meta = JSON.parse(asset.meta || "{}");
+              const meta = asset.meta || {};
               return (meta.originalName || "").replace(/\.[^.]+$/, "");
-            } catch {
-              return "";
-            }
+            } catch { return ""; }
           })();
           if (excerpt.length < 120 && orig) {
             wiki = await fetchWikiSummary(orig);
@@ -521,14 +457,8 @@ function runJob(id, asset, ctx) {
         } catch {}
 
         const prompt = `
-You are scripting a short educational podcast${
-          duet ? " with TWO speakers (Alex and Sam)" : ""
-        }.
-${
-  duet
-    ? "Write alternating lines starting with 'Alex:' and 'Sam:'."
-    : "Write a single narrator script."
-}
+You are scripting a short educational podcast${duet ? " with TWO speakers (Alex and Sam)" : ""}.
+${duet ? "Write alternating lines starting with 'Alex:' and 'Sam:'." : "Write a single narrator script."}
 
 Constraints:
 - Target length: ~${targetWords} words (≈ ${targetSeconds} seconds at ~${wpm} wpm).
@@ -545,17 +475,15 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
         const model = process.env.OLLAMA_MODEL || "llama3";
         log(`Calling Ollama at ${base} with model ${model} ...`);
         try {
-          // scriptText = await callOllama(prompt, { base, model });
-          scriptText =
-            "This video animates your uploaded slide. Add more pages for a richer episode.";
+          // const resp = await callOllama(prompt, { base, model });
+          // scriptText = resp;
+          scriptText = "This video animates your uploaded slide. Add more pages for a richer episode.";
         } catch (e) {
           log("Ollama call failed: " + e.message);
-          scriptText =
-            "Welcome to NoteFlix. This is an automatically generated study summary. Please review your notes and key definitions.";
+          scriptText = "Welcome to NoteFlix. This is an automatically generated study summary. Please review your notes and key definitions.";
         }
       } else {
-        scriptText =
-          "This video animates your uploaded slide. Add more pages for a richer episode.";
+        scriptText = "This video animates your uploaded slide. Add more pages for a richer episode.";
       }
 
       const scriptPath = path.join(ctx.jobDir, "script.txt");
@@ -567,39 +495,24 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
 
       let scriptLines;
       if (ctx.dialogue === "duet") {
-        const labeled = cleaned
-          .split(/\r?\n/)
-          .map((s) => s.trim())
-          .filter(Boolean);
+        const labeled = cleaned.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
         const hasLabels = labeled.some((l) => /^alex:|^sam:/i.test(l));
-        scriptLines = hasLabels
-          ? labeled.map((l) => l.replace(/^(alex|sam):\s*/i, ""))
-          : cleaned.split(/(?<=[.!?])\s+/).filter(Boolean);
+        scriptLines = hasLabels ? labeled.map((l) => l.replace(/^(alex|sam):\s*/i, "")) :
+                                  cleaned.split(/(?<=[.!?])\s+/).filter(Boolean);
       } else {
         scriptLines = [cleaned];
       }
 
-      fs.writeFileSync(
-        path.join(ctx.jobDir, "tts_clean.txt"),
-        scriptLines.join("\n"),
-        "utf8"
-      );
+      fs.writeFileSync(path.join(ctx.jobDir, "tts_clean.txt"), scriptLines.join("\n"), "utf8");
       log("Starting TTS synthesis (Piper)...");
       let narrationPath = null;
       try {
         narrationPath = path.join(ctx.jobDir, "narration.wav");
         const voices = {
-          voiceA:
-            process.env.PIPER_VOICE_A || "/app/models/en_US-amy-medium.onnx",
-          voiceB:
-            process.env.PIPER_VOICE_B || "/app/models/en_US-ryan-high.onnx",
+          voiceA: process.env.PIPER_VOICE_A || "/app/models/en_US-amy-medium.onnx",
+          voiceB: process.env.PIPER_VOICE_B || "/app/models/en_US-ryan-high.onnx",
         };
-        await synthesizePodcast(
-          scriptLines,
-          narrationPath,
-          ctx.dialogue === "duet",
-          voices
-        );
+        await synthesizePodcast(scriptLines, narrationPath, ctx.dialogue === "duet", voices);
         log("TTS synthesis complete");
       } catch (e) {
         log("TTS synthesis failed: " + e.message);
@@ -613,10 +526,7 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
       fs.writeFileSync(vttPath, vtt, "utf8");
 
       // 5) encoding
-      const slides = fs
-        .readdirSync(ctx.jobDir)
-        .filter((f) => /^slide-.*\.png$/i.test(f))
-        .sort();
+      const slides = fs.readdirSync(ctx.jobDir).filter((f) => /^slide-.*\.png$/i.test(f)).sort();
       const nSlides = Math.max(1, slides.length);
 
       let totalDuration = ctx.duration || 90;
@@ -634,10 +544,8 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
       const dFrames = perSlideSec * baseFps;
       const fr = 1 / perSlideSec;
 
-      const outW =
-        profile === "insane" ? 3840 : profile === "heavy" ? 2560 : 1920;
-      const outH =
-        profile === "insane" ? 2160 : profile === "heavy" ? 1440 : 1080;
+      const outW = profile === "insane" ? 3840 : profile === "heavy" ? 2560 : 1920;
+      const outH = profile === "insane" ? 2160 : profile === "heavy" ? 1440 : 1080;
 
       const zoom = `zoompan=z='zoom+0.001':d=${dFrames}:s=${outW}x${outH}`;
       const baseFilters = [
@@ -648,46 +556,25 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
         `vignette=PI/6`,
       ];
       if (profile !== "balanced") {
-        baseFilters.push(
-          `minterpolate='mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps=${baseFps}'`
-        );
+        baseFilters.push(`minterpolate='mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps=${baseFps}'`);
       }
       baseFilters.push(`format=yuv420p`);
       const vf = baseFilters.join(",");
-      const af = hasAudio
-        ? `-ar 48000 -af "loudnorm=I=-16:LRA=11:TP=-1.5"`
-        : "";
+      const af = hasAudio ? `-ar 48000 -af "loudnorm=I=-16:LRA=11:TP=-1.5"` : "";
 
-      const preset =
-        profile === "insane"
-          ? "veryslow"
-          : profile === "heavy"
-          ? "slower"
-          : "slow";
+      const preset = profile === "insane" ? "veryslow" : profile === "heavy" ? "slower" : "slow";
       const crf = profile === "insane" ? 16 : profile === "heavy" ? 18 : 20;
 
       if (profile !== "balanced") {
         const passlog = path.join(ctx.jobDir, "ffpass");
-        const cmd1 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${
-          ctx.jobDir
-        }/slide-*.png" ${
-          hasAudio ? `-i "${narrationPath}"` : ""
-        } -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p -an -pass 1 -passlogfile "${passlog}" -f mp4 /dev/null`;
+        const cmd1 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" ${hasAudio ? `-i "${narrationPath}"` : ""} -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p -an -pass 1 -passlogfile "${passlog}" -f mp4 /dev/null`;
         log("ENC PASS1: " + cmd1);
         const enc1 = spawn("bash", ["-lc", cmd1]);
         enc1.stdout.on("data", (d) => log(d.toString()));
         enc1.stderr.on("data", (d) => log(d.toString()));
         await new Promise((resolve) => enc1.on("close", resolve));
 
-        const cmd2 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${
-          ctx.jobDir
-        }/slide-*.png" ${
-          hasAudio ? `-i "${narrationPath}"` : ""
-        } -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p ${
-          hasAudio ? `${af} -c:a aac -b:a 192k` : ""
-        } -movflags +faststart -shortest -pass 2 -passlogfile "${passlog}" "${
-          ctx.outputPath
-        }"`;
+        const cmd2 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" ${hasAudio ? `-i "${narrationPath}"` : ""} -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p ${hasAudio ? `${af} -c:a aac -b:a 192k` : ""} -movflags +faststart -shortest -pass 2 -passlogfile "${passlog}" "${ctx.outputPath}"`;
         log("ENC PASS2: " + cmd2);
         const enc2 = spawn("bash", ["-lc", cmd2]);
         enc2.stdout.on("data", (d) => log(d.toString()));
@@ -705,8 +592,7 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
       }
 
       const cpuSeconds = Math.round((Date.now() - start) / 1000);
-      if (!fs.existsSync(ctx.outputPath))
-        throw new Error("ffmpeg failed to produce output");
+      if (!fs.existsSync(ctx.outputPath)) throw new Error("ffmpeg failed to produce output");
 
       try {
         const outputStat = fs.statSync(ctx.outputPath);
@@ -721,35 +607,32 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
           cpuSeconds,
           outputBytes: outputStat?.size || 0,
         };
-        fs.writeFileSync(
-          path.join(ctx.jobDir, "metrics.json"),
-          JSON.stringify(metrics, null, 2)
-        );
+        fs.writeFileSync(path.join(ctx.jobDir, "metrics.json"), JSON.stringify(metrics, null, 2));
       } catch (e) {
         log("WARN: failed to write metrics.json: " + e.message);
       }
 
       // Upload to S3 (if configured)
       let uploaded = false;
+      let s3Key = null;
       if (S3_BUCKET) {
         try {
-          const key = s3KeyForJob(id);
-          log(`Uploading output to s3://${S3_BUCKET}/${key} ...`);
-
-          await s3.send(
-            new PutObjectCommand({
-              Bucket: S3_BUCKET,
-              Key: key,
-              Body: fs.createReadStream(ctx.outputPath),
-              ContentType: "video/mp4",
-              ContentDisposition: 'attachment; filename="video.mp4"',
-            })
-          );
+          s3Key = s3KeyForJob(id);
+          log(`Uploading output to s3://${S3_BUCKET}/${s3Key} ...`);
+          await s3.send(new PutObjectCommand({
+            Bucket: S3_BUCKET,
+            Key: s3Key,
+            Body: fs.createReadStream(ctx.outputPath),
+            ContentType: "video/mp4",
+            ContentDisposition: 'attachment; filename="video.mp4"',
+          }));
           uploaded = true;
-          db.prepare(`UPDATE jobs SET s3Bucket=?, s3Key=? WHERE id=?`).run(
-            S3_BUCKET,
-            key,
-            id
+          await updateItem(
+            ctx.qutUser,
+            sks.job(id),
+            "SET #s3Bucket = :b, #s3Key = :k",
+            { "#s3Bucket": "s3Bucket", "#s3Key": "s3Key" },
+            { ":b": S3_BUCKET, ":k": s3Key }
           );
           log("S3 upload complete");
         } catch (e) {
@@ -758,29 +641,43 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
       }
 
       // Finalize
-      db.prepare(
-        `UPDATE jobs SET status='done', finishedAt=datetime('now'), cpuSeconds=?, outputPath=? WHERE id=?`
-      ).run(cpuSeconds, ctx.outputPath, id);
+      await updateItem(
+        ctx.qutUser,
+        sks.job(id),
+        "SET #status=:st, #finishedAt=:fin, #cpuSeconds=:cpu, #outputPath=:out",
+        {
+          "#status": "status",
+          "#finishedAt": "finishedAt",
+          "#cpuSeconds": "cpuSeconds",
+          "#outputPath": "outputPath",
+        },
+        {
+          ":st": "done",
+          ":fin": new Date().toISOString(),
+          ":cpu": Math.round((Date.now() - start) / 1000),
+          ":out": ctx.outputPath,
+        }
+      );
 
       // Audit: done
       putJobEvent(
         id,
-        qutUser,
+        ctx.qutUser,
         "done",
         uploaded ? "Encoding complete (uploaded to S3)" : "Encoding complete"
       ).catch(() => {});
 
       log("JOB DONE" + (uploaded ? " (and uploaded to S3)" : ""));
     } catch (err) {
-      const cpuSeconds = Math.round((Date.now() - start) / 1000);
-      db.prepare(
-        `UPDATE jobs SET status='failed', finishedAt=datetime('now'), cpuSeconds=? WHERE id=?`
-      ).run(cpuSeconds, id);
       const msg = err && err.message ? err.message : String(err);
-
-      // Audit: failed
-      putJobEvent(id, qutUser, "failed", msg).catch(() => {});
-
+      await updateItem(
+        ctx.qutUser,
+        sks.job(id),
+        "SET #status=:st, #finishedAt=:fin, #cpuSeconds=:cpu",
+        { "#status": "status", "#finishedAt": "finishedAt", "#cpuSeconds": "cpuSeconds" },
+        { ":st": "failed", ":fin": new Date().toISOString(), ":cpu": Math.round((Date.now() - start) / 1000) }
+      );
+      putJobEvent(id, ctx.qutUser, "failed", msg).catch(() => {});
       log("FAILED: " + msg);
     }
   })();
