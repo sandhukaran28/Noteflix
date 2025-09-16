@@ -118,6 +118,8 @@ async function loadConfig() {
     secrets,
   };
 
+  console.log("userpoolid", params[`${BASE}/cognito/userPoolId`] || process.env.COGNITO_USER_POOL_ID || "", cached.cognito.userPoolId);
+
   return cached;
 }
 

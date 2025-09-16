@@ -6,7 +6,7 @@ const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 const {
   DynamoDBDocumentClient,
   PutCommand,
-  GetCommand,
+  GetCommand, 
   UpdateCommand,
   DeleteCommand,
   QueryCommand,
@@ -26,17 +26,48 @@ const ddb = DynamoDBDocumentClient.from(ddbClient);
 // src/lib/config.js must export getConfig()
 const { getConfig } = require("./lib/config");
 
+// Replace in ddb.js
+
+function coerceQutEmail(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim().toLowerCase();
+
+  // already a QUT email
+  if (/@qut\.edu\.au$/.test(s)) return s;
+
+  // short id like n1234567 or e12345678 -> add domain
+  if (/^[a-z]\d{7,8}$/.test(s)) return `${s}@qut.edu.au`;
+
+  return null; // not acceptable for CAB432 DDB PK
+}
+
 function qutUsernameFromReqUser(user) {
-  try {
-    const cfg = getConfig();
-    if (cfg?.qut?.username) return String(cfg.qut.username).toLowerCase();
-  } catch (_) {}
-  if (process.env.QUT_USERNAME) {
-    return String(process.env.QUT_USERNAME).toLowerCase();
+  // 1) Prefer request-scoped identity claims
+  const candidates = [
+    user?.email,                    // best if it's ...@qut.edu.au
+    user?.["custom:qut_username"],  // if you collected it once for Gmail users
+    user?.qut_username,
+    user?.preferred_username,
+    user?.username,
+    user?.["cognito:username"],
+  ].filter(Boolean);
+
+  for (const c of candidates) {
+    const coerced = coerceQutEmail(c);
+    if (coerced) return coerced;
   }
-  // As a very last fallback, try using the auth subject (keeps dev flows unblocked)
-  if (user?.sub) return String(user.sub).toLowerCase();
-  throw new Error("QUT username not configured (missing in SSM/env) and no fallback from user.");
+
+  // 2) Default fallback: environment variable (DEV/marking convenience)
+  if (process.env.QUT_USERNAME) {
+    const dev = coerceQutEmail(process.env.QUT_USERNAME);
+    if (dev) return dev;
+  }
+
+  // 3) No acceptable value -> block (CAB432 requires QUT email as PK)
+  throw new Error(
+    "QUT username required. Provide a @qut.edu.au email or a short ID like n1234567 " +
+    "(set custom:qut_username or QUT_USERNAME env for dev)."
+  );
 }
 
 // ---------- Generic single-table helpers (PK = username; SK = namespaced) ----------
