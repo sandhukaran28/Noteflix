@@ -1,4 +1,4 @@
-﻿// src/routes/assets.js
+﻿// src/routes/assets.js (S3 + DynamoDB; no local persistence)
 "use strict";
 
 const { Router } = require("express");
@@ -7,45 +7,50 @@ const { v4: uuid } = require("uuid");
 const path = require("path");
 const fs = require("fs");
 const {
-  getJSON,
-  setJSON,
-  getVersion,
-  bumpVersion,
-  stableKeyFromObject,
+  getJSON, setJSON, getVersion, bumpVersion, stableKeyFromObject,
 } = require("../lib/cache");
 const {
-  DDB_PK_NAME,
-  sks,
-  putItem,
-  getItem,
-  deleteItem,
-  queryByPrefix,
-  qutUsernameFromReqUser,
+  DDB_PK_NAME, sks, putItem, getItem, deleteItem, queryByPrefix, qutUsernameFromReqUser,
 } = require("../ddb");
 
 const DATA_ROOT = process.env.DATA_ROOT || "./data";
-const ASSETS_DIR = path.join(DATA_ROOT, "assets");
-fs.mkdirSync(ASSETS_DIR, { recursive: true });
-
 const upload = multer({ dest: path.join(DATA_ROOT, "tmp") });
 const r = Router();
 
+// --- S3 setup ---
+const AWS_REGION = process.env.AWS_REGION || "ap-southeast-2";
+const ASSETS_BUCKET = process.env.S3_BUCKET;                    // REQUIRED
+const ASSETS_PREFIX = (process.env.ASSETS_PREFIX || "noteflix/assets").replace(/\/+$/,"");
+// if (!ASSETS_BUCKET) throw new Error("ASSETS_BUCKET env is required");
+
+const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+const s3 = new S3Client({ region: AWS_REGION });
+
+// POST /assets — upload to S3, record pointer in DynamoDB
 r.post("/", upload.single("file"), async (req, res) => {
   try {
     const user = req.user;
     if (!req.file) return res.status(400).json({ error: "file required" });
 
-    const qutUser = qutUsernameFromReqUser(user);
+    const qutUser = qutUsernameFromReqUser(user);     // CAB432 PK value
     const id = uuid();
     const ext = path.extname(req.file.originalname) || "";
-    const dstDir = path.join(ASSETS_DIR, id);
-    const dst = path.join(dstDir, `original${ext}`);
-    fs.mkdirSync(dstDir, { recursive: true });
-    fs.renameSync(req.file.path, dst);
-
+    const key = `${ASSETS_PREFIX}/${id}/original${ext}`;
     const type = ext.toLowerCase().includes(".pdf") ? "pdf" : "image";
     const now = new Date().toISOString();
 
+    // Upload the temp file to S3
+    await s3.send(new PutObjectCommand({
+      Bucket: ASSETS_BUCKET,
+      Key: key,
+      Body: fs.createReadStream(req.file.path),
+      ContentType: req.file.mimetype || (type === "pdf" ? "application/pdf" : "application/octet-stream"),
+      Metadata: { "original-name": req.file.originalname },
+    }));
+    // cleanup temp file
+    try { fs.unlinkSync(req.file.path); } catch {}
+
+    // Store metadata ONLY (no local path) in DynamoDB
     const item = {
       [DDB_PK_NAME]: qutUser,
       sk: sks.asset(id),
@@ -53,21 +58,22 @@ r.post("/", upload.single("file"), async (req, res) => {
       id,
       owner: user?.sub || "unknown",
       type,
-      path: dst,
+      s3Bucket: ASSETS_BUCKET,
+      s3Key: key,
       meta: { originalName: req.file.originalname },
       createdAt: now,
     };
     await putItem(item);
     await bumpVersion("assets", qutUser);
 
-    res.json({ id, type, path: dst });
+    res.json({ id, type, s3Bucket: ASSETS_BUCKET, s3Key: key, createdAt: now });
   } catch (e) {
     console.error("assets POST failed:", e);
     res.status(500).json({ error: "upload failed" });
   }
 });
 
-// GET /assets — pagination & filtering kept similar to old API
+// GET /assets — same pagination/filtering, now reading S3 pointers from DynamoDB
 r.get("/", async (req, res) => {
   try {
     const user = req.user;
@@ -77,24 +83,14 @@ r.get("/", async (req, res) => {
     const limit = Math.max(1, Math.min(100, parseInt(q.limit, 10) || 20));
     const offset = Math.max(0, parseInt(q.offset, 10) || 0);
 
-    const type =
-      typeof q.type === "string" && q.type.trim()
-        ? q.type.trim().toLowerCase()
-        : null;
+    const type = typeof q.type === "string" && q.type.trim() ? q.type.trim().toLowerCase() : null;
     const createdAfter = q.createdAfter?.trim() || null;
     const createdBefore = q.createdBefore?.trim() || null;
     const search = q.q?.trim() || null;
 
     const ver = await getVersion("assets", qutUser);
     const listKey = `assets:list:${qutUser}:v${ver}:${stableKeyFromObject({
-      limit,
-      offset,
-      type,
-      createdAfter,
-      createdBefore,
-      q: search,
-      sort: q.sort,
-      order: q.order,
+      limit, offset, type, createdAfter, createdBefore, q: search, sort: q.sort, order: q.order,
     })}`;
     const cached = await getJSON(listKey);
     if (cached) {
@@ -103,17 +99,12 @@ r.get("/", async (req, res) => {
       return res.json(cached);
     }
 
-    // Load all ASSET# for this user (bounded by a cap) and filter/sort in-memory
     let items = await queryByPrefix(qutUser, "ASSET#");
-
-    // Filter
     items = items.filter((it) => it.entity === "asset");
-    if (type)
-      items = items.filter((it) => String(it.type).toLowerCase() === type);
-    if (createdAfter)
-      items = items.filter((it) => (it.createdAt || "") >= createdAfter);
-    if (createdBefore)
-      items = items.filter((it) => (it.createdAt || "") <= createdBefore);
+
+    if (type) items = items.filter((it) => String(it.type).toLowerCase() === type);
+    if (createdAfter) items = items.filter((it) => (it.createdAt || "") >= createdAfter);
+    if (createdBefore) items = items.filter((it) => (it.createdAt || "") <= createdBefore);
     if (search) {
       const s = search.toLowerCase();
       items = items.filter((it) => {
@@ -122,16 +113,9 @@ r.get("/", async (req, res) => {
       });
     }
 
-    // Sort (default by createdAt desc to mirror previous)
-    const allowedSort = {
-      rowid: "sk",
-      createdAt: "createdAt",
-      type: "type",
-      id: "id",
-    };
+    const allowedSort = { rowid: "sk", createdAt: "createdAt", type: "type", id: "id" };
     const sortKey = allowedSort[req.query.sort] || "createdAt";
-    const orderDir =
-      (req.query.order || "desc").toLowerCase() === "asc" ? "asc" : "desc";
+    const orderDir = (req.query.order || "desc").toLowerCase() === "asc" ? "asc" : "desc";
     items.sort((a, b) => {
       const av = a[sortKey] ?? "";
       const bv = b[sortKey] ?? "";
@@ -144,7 +128,6 @@ r.get("/", async (req, res) => {
     const totalPages = Math.ceil(total / limit);
     const paged = items.slice(offset, offset + limit);
 
-    // header + old response shape
     res.setHeader("X-Total-Count", String(total));
     const payload = {
       totalItems: total,
@@ -153,9 +136,9 @@ r.get("/", async (req, res) => {
       totalPages,
       items: paged,
     };
-    +(await setJSON(listKey, payload, 120));
-    +res.setHeader("X-Cache", "MISS");
-    +res.json(payload);
+    await setJSON(listKey, payload, 120);
+    res.setHeader("X-Cache", "MISS");
+    res.json(payload);
   } catch (e) {
     console.error("assets LIST failed:", e);
     res.status(500).json({ error: "list failed" });
@@ -192,11 +175,17 @@ r.delete("/:id", async (req, res) => {
     const item = await getItem(qutUser, sks.asset(id));
     if (!item) return res.status(404).json({ error: "not found" });
 
-    await deleteItem(qutUser, sks.asset(id));
+    // delete from S3 first (best-effort)
     try {
-      fs.rmSync(path.dirname(item.path), { recursive: true, force: true });
-    } catch {}
+      if (item.s3Bucket && item.s3Key) {
+        await s3.send(new DeleteObjectCommand({ Bucket: item.s3Bucket, Key: item.s3Key }));
+      }
+    } catch (_) {}
+
+    // remove the DynamoDB record
+    await deleteItem(qutUser, sks.asset(id));
     await bumpVersion("assets", qutUser);
+
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: "delete failed" });
