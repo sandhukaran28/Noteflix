@@ -39,12 +39,16 @@ const {
 const DATA_ROOT = process.env.DATA_ROOT || "./data";
 const TMP_DIR = path.join(DATA_ROOT, "tmp");
 const OUT_DIR = path.join(DATA_ROOT, "outputs");
+const { pipeline } = require("stream/promises");
 fs.mkdirSync(TMP_DIR, { recursive: true });
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
 const s3 = new S3Client({ region: process.env.AWS_REGION || "ap-southeast-2" });
 const S3_BUCKET = process.env.S3_BUCKET;
-const S3_PREFIX = (process.env.S3_PREFIX || "noteflix/outputs").replace(/\/+$/, "");
+const S3_PREFIX = (process.env.S3_PREFIX || "noteflix/outputs").replace(
+  /\/+$/,
+  ""
+);
 
 const r = Router();
 
@@ -62,11 +66,21 @@ function hasCmd(name) {
   return r.status === 0 && r.stdout.trim().length > 0;
 }
 
+async function downloadS3ToFile(bucket, key, toPath) {
+  const resp = await s3.send(
+    new GetObjectCommand({ Bucket: bucket, Key: key })
+  );
+  await pipeline(resp.Body, fs.createWriteStream(toPath));
+}
+
 function getAudioDuration(file) {
   try {
     const out = spawnSync(
       "bash",
-      ["-lc", `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${file}"`],
+      [
+        "-lc",
+        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${file}"`,
+      ],
       { encoding: "utf8" }
     );
     if (out.status === 0) return Math.ceil(parseFloat(out.stdout.trim()));
@@ -76,8 +90,17 @@ function getAudioDuration(file) {
 
 async function callOllama(prompt, { base, model }) {
   const url = `${base || "http://localhost:11434"}/api/generate`;
-  const body = { model: model || "llama3", prompt, stream: false, options: { temperature: 0.6 } };
-  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const body = {
+    model: model || "llama3",
+    prompt,
+    stream: false,
+    options: { temperature: 0.6 },
+  };
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
   if (!res.ok) throw new Error(`Ollama HTTP ${res.status}`);
   const json = await res.json();
   return json.response;
@@ -205,7 +228,8 @@ r.get("/", async (req, res) => {
     const limit = Math.max(1, Math.min(100, parseInt(q.limit, 10) || 20));
     const offset = Math.max(0, parseInt(q.offset, 10) || 0);
 
-    const status = typeof q.status === "string" && q.status.trim() ? q.status.trim() : null;
+    const status =
+      typeof q.status === "string" && q.status.trim() ? q.status.trim() : null;
     const assetId = q.assetId?.trim() || null;
     const startedAfter = q.startedAfter?.trim() || null;
     const finishedBefore = q.finishedBefore?.trim() || null;
@@ -235,8 +259,10 @@ r.get("/", async (req, res) => {
     // Filters
     if (status) items = items.filter((it) => it.status === status);
     if (assetId) items = items.filter((it) => it.assetId === assetId);
-    if (startedAfter) items = items.filter((it) => (it.startedAt || "") >= startedAfter);
-    if (finishedBefore) items = items.filter((it) => (it.finishedAt || "") <= finishedBefore);
+    if (startedAfter)
+      items = items.filter((it) => (it.startedAt || "") >= startedAfter);
+    if (finishedBefore)
+      items = items.filter((it) => (it.finishedAt || "") <= finishedBefore);
 
     // Sorting (mirror old behavior)
     const allowedFields = ["rowid", "createdAt", "startedAt", "finishedAt"];
@@ -249,7 +275,10 @@ r.get("/", async (req, res) => {
       requestedField = (f || "").trim() || "createdAt";
       dirFromSort = (d || "").trim();
     }
-    const orderDir = (dirFromSort || q.order || "desc").toLowerCase() === "asc" ? "asc" : "desc";
+    const orderDir =
+      (dirFromSort || q.order || "desc").toLowerCase() === "asc"
+        ? "asc"
+        : "desc";
 
     let sortField = "createdAt";
     if (requestedField === "rowid") sortField = "sk";
@@ -337,7 +366,8 @@ r.get("/:id/audit", async (req, res) => {
 r.get("/:id/logs", async (req, res) => {
   const qutUser = qutUsernameFromReqUser(req.user);
   const row = await getItem(qutUser, sks.job(req.params.id));
-  if (!row || !row.logsPath) return res.status(404).json({ error: "not found" });
+  if (!row || !row.logsPath)
+    return res.status(404).json({ error: "not found" });
   if (!fs.existsSync(row.logsPath)) return res.status(200).send("");
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   fs.createReadStream(row.logsPath).pipe(res);
@@ -384,7 +414,8 @@ r.get("/:id/output", async (req, res) => {
     if (!m) return res.status(416).end();
     let start = m[1] ? parseInt(m[1], 10) : 0;
     let end = m[2] ? parseInt(m[2], 10) : stat.size - 1;
-    if (isNaN(start) || isNaN(end) || start > end || end >= stat.size) return res.status(416).end();
+    if (isNaN(start) || isNaN(end) || start > end || end >= stat.size)
+      return res.status(416).end();
     res.status(206);
     res.setHeader("Content-Range", `bytes ${start}-${end}/${stat.size}`);
     res.setHeader("Content-Length", String(end - start + 1));
@@ -404,7 +435,8 @@ r.get("/:id/captions", async (req, res) => {
   if (!jobDir) return res.status(404).json({ error: "not found" });
 
   const vttPath = path.join(jobDir, "captions.vtt");
-  if (!fs.existsSync(vttPath)) return res.status(404).json({ error: "no captions" });
+  if (!fs.existsSync(vttPath))
+    return res.status(404).json({ error: "no captions" });
 
   res.setHeader("Content-Type", "text/vtt; charset=utf-8");
   res.setHeader("Content-Disposition", "attachment; filename=captions.vtt");
@@ -420,7 +452,8 @@ r.get("/:id/script", async (req, res) => {
   if (!jobDir) return res.status(404).json({ error: "not found" });
 
   const scriptPath = path.join(jobDir, "script.txt");
-  if (!fs.existsSync(scriptPath)) return res.status(404).json({ error: "no script" });
+  if (!fs.existsSync(scriptPath))
+    return res.status(404).json({ error: "no script" });
 
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.setHeader("Content-Disposition", "attachment; filename=script.txt");
@@ -436,7 +469,8 @@ r.get("/:id/metrics", async (req, res) => {
   if (!jobDir) return res.status(404).json({ error: "not found" });
 
   const metricsPath = path.join(jobDir, "metrics.json");
-  if (!fs.existsSync(metricsPath)) return res.status(404).json({ error: "no metrics" });
+  if (!fs.existsSync(metricsPath))
+    return res.status(404).json({ error: "no metrics" });
 
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   fs.createReadStream(metricsPath).pipe(res);
@@ -466,30 +500,65 @@ async function runJob(id, asset, ctx) {
   (async () => {
     try {
       // 1) PDF -> images (or copy single image)
-      const isPdf = asset.type === "pdf";
+      // 1) Materialize source file (from S3 or local legacy) → then PDF->images or copy image
+      const jobDir = ctx.jobDir;
+      fs.mkdirSync(jobDir, { recursive: true });
+
+      // decide where to read from
+      let sourcePath; // the local, materialized file we will use
+      let isPdf;
+
+      // Prefer S3 pointers (new stateless flow)
+      if (asset.s3Bucket && asset.s3Key) {
+        // infer extension/type
+        const ext = path.extname(asset.s3Key || "").toLowerCase();
+        isPdf = asset.type === "pdf" || ext === ".pdf";
+        sourcePath = path.join(
+          jobDir,
+          "source" + (ext || (isPdf ? ".pdf" : ""))
+        );
+
+        // download to tmp
+        await downloadS3ToFile(asset.s3Bucket, asset.s3Key, sourcePath);
+      } else {
+        // legacy/local path fallback (for old data)
+        if (!asset.path)
+          throw new Error("asset has no s3Key and no local path");
+        sourcePath = asset.path;
+        const ext = path.extname(sourcePath || "").toLowerCase();
+        isPdf = asset.type === "pdf" || ext === ".pdf";
+      }
+
       if (isPdf) {
-        if (!hasCmd("pdftoppm")) throw new Error("pdftoppm not found (install poppler-utils)");
-        const p1 = sh(`mkdir -p "${ctx.jobDir}" && pdftoppm -png "${asset.path}" "${ctx.jobDir}/slide"`);
-        log(p1.stdout || ""); log(p1.stderr || "");
+        if (!hasCmd("pdftoppm"))
+          throw new Error("pdftoppm not found (install poppler-utils)");
+        const p1 = sh(`pdftoppm -png "${sourcePath}" "${jobDir}/slide"`);
+        log(p1.stdout || "");
+        log(p1.stderr || "");
         if (p1.status !== 0) throw new Error("pdf->images failed");
       } else {
-        sh(`mkdir -p "${ctx.jobDir}"`);
-        const p1 = sh(`cp "${asset.path}" "${ctx.jobDir}/slide-001.png"`);
+        const slide1 = path.join(jobDir, "slide-001.png");
+        // If source is already a PNG/JPG, let ffmpeg read it as PNG—cp is fine
+        const p1 = sh(`cp "${sourcePath}" "${slide1}"`);
         log(p1.stderr || "");
         if (p1.status !== 0) throw new Error("copy image failed");
       }
 
-      const ls = sh(`ls -l "${ctx.jobDir}" | head -n 40`);
-      log(ls.stdout || ""); log(ls.stderr || "");
+      // visibility for debugging
+      const ls = sh(`ls -l "${jobDir}" | head -n 40`);
+      log(ls.stdout || "");
+      log(ls.stderr || "");
 
       // 2) Extract text + Ollama script (duration-aware)
       let scriptText = "";
       if (isPdf) {
-        if (!hasCmd("pdftotext")) log("WARN: pdftotext not found; using fallback summary prompt.");
+        if (!hasCmd("pdftotext"))
+          log("WARN: pdftotext not found; using fallback summary prompt.");
         let notes = "";
         if (hasCmd("pdftotext")) {
           const textPath = path.join(ctx.jobDir, "notes.txt");
-          const t1 = sh(`pdftotext "${asset.path}" "${textPath}"`);
+          const t1 = sh(`pdftotext "${sourcePath}" "${textPath}"`);
+
           log(t1.stderr || "");
           if (t1.status === 0 && fs.existsSync(textPath)) {
             notes = fs.readFileSync(textPath, "utf8");
@@ -497,7 +566,10 @@ async function runJob(id, asset, ctx) {
         }
 
         const wpm = 150;
-        const targetSeconds = Math.max(30, Math.min(600, Number(ctx.duration || 90)));
+        const targetSeconds = Math.max(
+          30,
+          Math.min(600, Number(ctx.duration || 90))
+        );
         const targetWords = Math.round((wpm / 60) * targetSeconds);
 
         const duet = ctx.dialogue === "duet";
@@ -509,7 +581,9 @@ async function runJob(id, asset, ctx) {
             try {
               const meta = asset.meta || {};
               return (meta.originalName || "").replace(/\.[^.]+$/, "");
-            } catch { return ""; }
+            } catch {
+              return "";
+            }
           })();
           if (excerpt.length < 120 && orig) {
             wiki = await fetchWikiSummary(orig);
@@ -517,8 +591,14 @@ async function runJob(id, asset, ctx) {
         } catch {}
 
         const prompt = `
-You are scripting a short educational podcast${duet ? " with TWO speakers (Alex and Sam)" : ""}.
-${duet ? "Write alternating lines starting with 'Alex:' and 'Sam:'." : "Write a single narrator script."}
+You are scripting a short educational podcast${
+          duet ? " with TWO speakers (Alex and Sam)" : ""
+        }.
+${
+  duet
+    ? "Write alternating lines starting with 'Alex:' and 'Sam:'."
+    : "Write a single narrator script."
+}
 
 Constraints:
 - Target length: ~${targetWords} words (≈ ${targetSeconds} seconds at ~${wpm} wpm).
@@ -537,13 +617,16 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
         try {
           // const resp = await callOllama(prompt, { base, model });
           // scriptText = resp;
-          scriptText = "This video animates your uploaded slide. Add more pages for a richer episode.";
+          scriptText =
+            "This video animates your uploaded slide. Add more pages for a richer episode.";
         } catch (e) {
           log("Ollama call failed: " + e.message);
-          scriptText = "Welcome to NoteFlix. This is an automatically generated study summary. Please review your notes and key definitions.";
+          scriptText =
+            "Welcome to NoteFlix. This is an automatically generated study summary. Please review your notes and key definitions.";
         }
       } else {
-        scriptText = "This video animates your uploaded slide. Add more pages for a richer episode.";
+        scriptText =
+          "This video animates your uploaded slide. Add more pages for a richer episode.";
       }
 
       const scriptPath = path.join(ctx.jobDir, "script.txt");
@@ -555,24 +638,39 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
 
       let scriptLines;
       if (ctx.dialogue === "duet") {
-        const labeled = cleaned.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+        const labeled = cleaned
+          .split(/\r?\n/)
+          .map((s) => s.trim())
+          .filter(Boolean);
         const hasLabels = labeled.some((l) => /^alex:|^sam:/i.test(l));
-        scriptLines = hasLabels ? labeled.map((l) => l.replace(/^(alex|sam):\s*/i, "")) :
-                                  cleaned.split(/(?<=[.!?])\s+/).filter(Boolean);
+        scriptLines = hasLabels
+          ? labeled.map((l) => l.replace(/^(alex|sam):\s*/i, ""))
+          : cleaned.split(/(?<=[.!?])\s+/).filter(Boolean);
       } else {
         scriptLines = [cleaned];
       }
 
-      fs.writeFileSync(path.join(ctx.jobDir, "tts_clean.txt"), scriptLines.join("\n"), "utf8");
+      fs.writeFileSync(
+        path.join(ctx.jobDir, "tts_clean.txt"),
+        scriptLines.join("\n"),
+        "utf8"
+      );
       log("Starting TTS synthesis (Piper)...");
       let narrationPath = null;
       try {
         narrationPath = path.join(ctx.jobDir, "narration.wav");
         const voices = {
-          voiceA: process.env.PIPER_VOICE_A || "/app/models/en_US-amy-medium.onnx",
-          voiceB: process.env.PIPER_VOICE_B || "/app/models/en_US-ryan-high.onnx",
+          voiceA:
+            process.env.PIPER_VOICE_A || "/app/models/en_US-amy-medium.onnx",
+          voiceB:
+            process.env.PIPER_VOICE_B || "/app/models/en_US-ryan-high.onnx",
         };
-        await synthesizePodcast(scriptLines, narrationPath, ctx.dialogue === "duet", voices);
+        await synthesizePodcast(
+          scriptLines,
+          narrationPath,
+          ctx.dialogue === "duet",
+          voices
+        );
         log("TTS synthesis complete");
       } catch (e) {
         log("TTS synthesis failed: " + e.message);
@@ -586,7 +684,10 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
       fs.writeFileSync(vttPath, vtt, "utf8");
 
       // 5) encoding
-      const slides = fs.readdirSync(ctx.jobDir).filter((f) => /^slide-.*\.png$/i.test(f)).sort();
+      const slides = fs
+        .readdirSync(ctx.jobDir)
+        .filter((f) => /^slide-.*\.png$/i.test(f))
+        .sort();
       const nSlides = Math.max(1, slides.length);
 
       let totalDuration = ctx.duration || 90;
@@ -604,8 +705,10 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
       const dFrames = perSlideSec * baseFps;
       const fr = 1 / perSlideSec;
 
-      const outW = profile === "insane" ? 3840 : profile === "heavy" ? 2560 : 1920;
-      const outH = profile === "insane" ? 2160 : profile === "heavy" ? 1440 : 1080;
+      const outW =
+        profile === "insane" ? 3840 : profile === "heavy" ? 2560 : 1920;
+      const outH =
+        profile === "insane" ? 2160 : profile === "heavy" ? 1440 : 1080;
 
       const zoom = `zoompan=z='zoom+0.001':d=${dFrames}:s=${outW}x${outH}`;
       const baseFilters = [
@@ -616,25 +719,46 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
         `vignette=PI/6`,
       ];
       if (profile !== "balanced") {
-        baseFilters.push(`minterpolate='mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps=${baseFps}'`);
+        baseFilters.push(
+          `minterpolate='mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps=${baseFps}'`
+        );
       }
       baseFilters.push(`format=yuv420p`);
       const vf = baseFilters.join(",");
-      const af = hasAudio ? `-ar 48000 -af "loudnorm=I=-16:LRA=11:TP=-1.5"` : "";
+      const af = hasAudio
+        ? `-ar 48000 -af "loudnorm=I=-16:LRA=11:TP=-1.5"`
+        : "";
 
-      const preset = profile === "insane" ? "veryslow" : profile === "heavy" ? "slower" : "slow";
+      const preset =
+        profile === "insane"
+          ? "veryslow"
+          : profile === "heavy"
+          ? "slower"
+          : "slow";
       const crf = profile === "insane" ? 16 : profile === "heavy" ? 18 : 20;
 
       if (profile !== "balanced") {
         const passlog = path.join(ctx.jobDir, "ffpass");
-        const cmd1 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" ${hasAudio ? `-i "${narrationPath}"` : ""} -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p -an -pass 1 -passlogfile "${passlog}" -f mp4 /dev/null`;
+        const cmd1 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${
+          ctx.jobDir
+        }/slide-*.png" ${
+          hasAudio ? `-i "${narrationPath}"` : ""
+        } -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p -an -pass 1 -passlogfile "${passlog}" -f mp4 /dev/null`;
         log("ENC PASS1: " + cmd1);
         const enc1 = spawn("bash", ["-lc", cmd1]);
         enc1.stdout.on("data", (d) => log(d.toString()));
         enc1.stderr.on("data", (d) => log(d.toString()));
         await new Promise((resolve) => enc1.on("close", resolve));
 
-        const cmd2 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" ${hasAudio ? `-i "${narrationPath}"` : ""} -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p ${hasAudio ? `${af} -c:a aac -b:a 192k` : ""} -movflags +faststart -shortest -pass 2 -passlogfile "${passlog}" "${ctx.outputPath}"`;
+        const cmd2 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${
+          ctx.jobDir
+        }/slide-*.png" ${
+          hasAudio ? `-i "${narrationPath}"` : ""
+        } -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p ${
+          hasAudio ? `${af} -c:a aac -b:a 192k` : ""
+        } -movflags +faststart -shortest -pass 2 -passlogfile "${passlog}" "${
+          ctx.outputPath
+        }"`;
         log("ENC PASS2: " + cmd2);
         const enc2 = spawn("bash", ["-lc", cmd2]);
         enc2.stdout.on("data", (d) => log(d.toString()));
@@ -652,7 +776,8 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
       }
 
       const cpuSeconds = Math.round((Date.now() - start) / 1000);
-      if (!fs.existsSync(ctx.outputPath)) throw new Error("ffmpeg failed to produce output");
+      if (!fs.existsSync(ctx.outputPath))
+        throw new Error("ffmpeg failed to produce output");
 
       try {
         const outputStat = fs.statSync(ctx.outputPath);
@@ -667,7 +792,10 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
           cpuSeconds,
           outputBytes: outputStat?.size || 0,
         };
-        fs.writeFileSync(path.join(ctx.jobDir, "metrics.json"), JSON.stringify(metrics, null, 2));
+        fs.writeFileSync(
+          path.join(ctx.jobDir, "metrics.json"),
+          JSON.stringify(metrics, null, 2)
+        );
       } catch (e) {
         log("WARN: failed to write metrics.json: " + e.message);
       }
@@ -679,13 +807,15 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
         try {
           s3Key = s3KeyForJob(id);
           log(`Uploading output to s3://${S3_BUCKET}/${s3Key} ...`);
-          await s3.send(new PutObjectCommand({
-            Bucket: S3_BUCKET,
-            Key: s3Key,
-            Body: fs.createReadStream(ctx.outputPath),
-            ContentType: "video/mp4",
-            ContentDisposition: 'attachment; filename="video.mp4"',
-          }));
+          await s3.send(
+            new PutObjectCommand({
+              Bucket: S3_BUCKET,
+              Key: s3Key,
+              Body: fs.createReadStream(ctx.outputPath),
+              ContentType: "video/mp4",
+              ContentDisposition: 'attachment; filename="video.mp4"',
+            })
+          );
           uploaded = true;
           await updateItem(
             ctx.qutUser,
@@ -736,8 +866,16 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
         ctx.qutUser,
         sks.job(id),
         "SET #status=:st, #finishedAt=:fin, #cpuSeconds=:cpu",
-        { "#status": "status", "#finishedAt": "finishedAt", "#cpuSeconds": "cpuSeconds" },
-        { ":st": "failed", ":fin": new Date().toISOString(), ":cpu": Math.round((Date.now() - start) / 1000) }
+        {
+          "#status": "status",
+          "#finishedAt": "finishedAt",
+          "#cpuSeconds": "cpuSeconds",
+        },
+        {
+          ":st": "failed",
+          ":fin": new Date().toISOString(),
+          ":cpu": Math.round((Date.now() - start) / 1000),
+        }
       );
       await bumpVersion("jobs", ctx.qutUser);
       putJobEvent(id, ctx.qutUser, "failed", msg).catch(() => {});
