@@ -10,8 +10,9 @@ const {
   getJSON, setJSON, getVersion, bumpVersion, stableKeyFromObject,
 } = require("../lib/cache");
 const {
-  DDB_PK_NAME, sks, putItem, getItem, deleteItem, queryByPrefix, qutUsernameFromReqUser,
+  DDB_PK_NAME, sks, putItem, getItem, deleteItem, queryByPrefix, qutUsernameFromReqUser, scanBySkPrefix,
 } = require("../ddb");
+const { isAdmin, requireGroup } = require("../middleware/auth");
 
 const DATA_ROOT = process.env.DATA_ROOT || "./data";
 const upload = multer({ dest: path.join(DATA_ROOT, "tmp") });
@@ -26,13 +27,26 @@ const ASSETS_PREFIX = (process.env.ASSETS_PREFIX || "noteflix/assets").replace(/
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const s3 = new S3Client({ region: AWS_REGION });
 
+function coerceAs(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim().toLowerCase();
+  if (/@qut\.edu\.au$/.test(s)) return s;
+  if (/^[a-z]\d{7,8}$/.test(s)) return `${s}@qut.edu.au`;
+  return null;
+}
+
 // POST /assets — upload to S3, record pointer in DynamoDB
 r.post("/", upload.single("file"), async (req, res) => {
   try {
     const user = req.user;
     if (!req.file) return res.status(400).json({ error: "file required" });
 
-    const qutUser = qutUsernameFromReqUser(user);     // CAB432 PK value
+    let qutUser = qutUsernameFromReqUser(user);     // CAB432 PK value
+    const asOverride = (req.query.as || req.body?.as || "").toString().trim();
+    if (asOverride && isAdmin(req)) {
+      const coerced = coerceAs(asOverride);
+      if (coerced) qutUser = coerced;
+    }
     const id = uuid();
     const ext = path.extname(req.file.originalname) || "";
     const key = `${ASSETS_PREFIX}/${id}/original${ext}`;
@@ -73,12 +87,17 @@ r.post("/", upload.single("file"), async (req, res) => {
   }
 });
 
-// GET /assets — same pagination/filtering, now reading S3 pointers from DynamoDB
+// GET /assets — same pagination/filtering, admin can view all with ?all=1
 r.get("/", async (req, res) => {
   try {
     const user = req.user;
-    const qutUser = qutUsernameFromReqUser(user);
+    let qutUser = qutUsernameFromReqUser(user);
     const q = req.query || {};
+
+    if (q.as && isAdmin(req)) {
+      const coerced = coerceAs(q.as);
+      if (coerced) qutUser = coerced;
+    }
 
     const limit = Math.max(1, Math.min(100, parseInt(q.limit, 10) || 20));
     const offset = Math.max(0, parseInt(q.offset, 10) || 0);
@@ -88,18 +107,23 @@ r.get("/", async (req, res) => {
     const createdBefore = q.createdBefore?.trim() || null;
     const search = q.q?.trim() || null;
 
+    const adminAll = isAdmin(req) && String(q.all || "").toLowerCase() === "1";
     const ver = await getVersion("assets", qutUser);
-    const listKey = `assets:list:${qutUser}:v${ver}:${stableKeyFromObject({
-      limit, offset, type, createdAfter, createdBefore, q: search, sort: q.sort, order: q.order,
-    })}`;
-    const cached = await getJSON(listKey);
-    if (cached) {
-      res.setHeader("X-Cache", "HIT");
-      res.setHeader("X-Total-Count", String(cached.totalItems ?? 0));
-      return res.json(cached);
+    const listKey = adminAll
+      ? null
+      : `assets:list:${qutUser}:v${ver}:${stableKeyFromObject({
+          limit, offset, type, createdAfter, createdBefore, q: search, sort: q.sort, order: q.order,
+        })}`;
+    if (listKey) {
+      const cached = await getJSON(listKey);
+      if (cached) {
+        res.setHeader("X-Cache", "HIT");
+        res.setHeader("X-Total-Count", String(cached.totalItems ?? 0));
+        return res.json(cached);
+      }
     }
 
-    let items = await queryByPrefix(qutUser, "ASSET#");
+    let items = adminAll ? await scanBySkPrefix("ASSET#") : await queryByPrefix(qutUser, "ASSET#");
     items = items.filter((it) => it.entity === "asset");
 
     if (type) items = items.filter((it) => String(it.type).toLowerCase() === type);
@@ -136,8 +160,9 @@ r.get("/", async (req, res) => {
       totalPages,
       items: paged,
     };
-    await setJSON(listKey, payload, 120);
-    res.setHeader("X-Cache", "MISS");
+    if (listKey) await setJSON(listKey, payload, 120);
+    res.setHeader("X-Cache", listKey ? "MISS" : "BYPASS");
+    if (!listKey) res.setHeader("X-Admin-All", "1");
     res.json(payload);
   } catch (e) {
     console.error("assets LIST failed:", e);
@@ -148,7 +173,12 @@ r.get("/", async (req, res) => {
 r.get("/:id", async (req, res) => {
   try {
     const user = req.user;
-    const qutUser = qutUsernameFromReqUser(user);
+    let qutUser = qutUsernameFromReqUser(user);
+    const asOverride = (req.query.as || "").toString().trim();
+    if (asOverride && isAdmin(req)) {
+      const coerced = coerceAs(asOverride);
+      if (coerced) qutUser = coerced;
+    }
     const id = req.params.id;
     const ver = await getVersion("assets", qutUser);
     const key = `assets:detail:${qutUser}:v${ver}:${id}`;
@@ -166,10 +196,15 @@ r.get("/:id", async (req, res) => {
   }
 });
 
-r.delete("/:id", async (req, res) => {
+r.delete("/:id", requireGroup(process.env.COGNITO_ADMIN_GROUP || "Admin"), async (req, res) => {
   try {
     const user = req.user;
-    const qutUser = qutUsernameFromReqUser(user);
+    let qutUser = qutUsernameFromReqUser(user);
+    const asOverride = (req.query.as || "").toString().trim();
+    if (asOverride && isAdmin(req)) {
+      const coerced = coerceAs(asOverride);
+      if (coerced) qutUser = coerced;
+    }
     const id = req.params.id;
 
     const item = await getItem(qutUser, sks.asset(id));

@@ -10,6 +10,7 @@ const {
   UpdateCommand,
   DeleteCommand,
   QueryCommand,
+  ScanCommand,
 } = require("@aws-sdk/lib-dynamodb");
 
 // Table & partition-key policy (CAB432)
@@ -128,6 +129,27 @@ async function queryByPrefix(pk, skPrefix, { hardCap = 5000 } = {}) {
   return items;
 }
 
+/**
+ * Scan all items across users filtered by an SK prefix. Admin-only use case.
+ * This is O(table) so keep hardCap conservative.
+ */
+async function scanBySkPrefix(skPrefix, { hardCap = 5000 } = {}) {
+  let items = [];
+  let ExclusiveStartKey;
+  do {
+    const res = await ddb.send(new ScanCommand({
+      TableName: DDB_TABLE,
+      FilterExpression: "begins_with(#sk, :p)",
+      ExpressionAttributeNames: { "#sk": "sk" },
+      ExpressionAttributeValues: { ":p": skPrefix },
+      ExclusiveStartKey,
+    }));
+    if (res.Items?.length) items.push(...res.Items);
+    ExclusiveStartKey = res.LastEvaluatedKey;
+  } while (ExclusiveStartKey && items.length < hardCap);
+  return items;
+}
+
 // ---------- Audit events (unchanged API) ----------
 async function putJobEvent(jobId, qutUsername, status, message = "") {
   if (!qutUsername) {
@@ -172,6 +194,7 @@ module.exports = {
 
   // generic helpers
   putItem, getItem, updateItem, deleteItem, queryByPrefix,
+  scanBySkPrefix,
 
   // identity + audit
   qutUsernameFromReqUser,

@@ -59,12 +59,18 @@ function auth(required = true) {
   };
 }
 
-function requireRole(role) {
+function requireGroup(groupName) {
   return (req, res, next) => {
     const groups = req.user?.groups || [];
-    if (!groups.includes(role)) return res.status(403).json({ error: "forbidden" });
+    if (!groups.includes(groupName)) return res.status(403).json({ error: "forbidden" });
     next();
   };
 }
 
-module.exports = { auth, requireRole };
+function isAdmin(req) {
+  const groups = req.user?.groups || [];
+  const adminGroup = process.env.COGNITO_ADMIN_GROUP || "Admin";
+  return groups.includes(adminGroup);
+}
+
+module.exports = { auth, requireGroup, isAdmin };
